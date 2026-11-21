@@ -137,7 +137,9 @@ fn chunks(dir: &Path) -> Vec<Chunk> {
             let map = Arc::new(if std::env::var("READ").is_ok() {
                 Src::V(fs::read(p).expect("read"))
             } else {
-                Src::M(unsafe { memmap2::MmapOptions::new().populate().map(&f).expect("mmap") })
+                // no populate here: each chunk populates its own pages when a worker takes it,
+                // so on a cold page cache the disk reads of all workers overlap
+                Src::M(unsafe { memmap2::MmapOptions::new().map(&f).expect("mmap") })
             });
             let data: &[u8] = &map;
             let Some(h) = memchr::memchr(b'\n', data) else { return out };
@@ -163,7 +165,55 @@ fn chunks(dir: &Path) -> Vec<Chunk> {
 /// finds all '\n', ',' and '"' bytes. Malformed and empty lines are skipped.
 #[inline]
 fn for_records<const N: usize>(c: &Chunk, f: impl FnMut([&[u8]; N])) {
+    if let Src::M(m) = &*c.map {
+        // Map this chunk's pages in one call (Linux 5.14+; ignored where unsupported) instead
+        // of one page fault per 4 KB while scanning.
+        const MADV_POPULATE_READ: i32 = 22;
+        let base = m.as_ptr() as usize;
+        let a = (base + c.start) & !4095;
+        let b = base + c.end;
+        unsafe { libc::madvise(a as *mut libc::c_void, b - a, MADV_POPULATE_READ) };
+    }
     records::<N>(&c.map[c.start..c.end], f)
+}
+
+/// Two background threads that walk all input files in processing order (links, events,
+/// clicks) issuing readahead(2) in 512 KB steps, so a cold page cache is filled from disk
+/// ahead of (and alongside) the parsing workers. On a warm cache these calls return at once.
+fn start_readahead(data: &Path) {
+    let mut files: Vec<PathBuf> = vec![];
+    for d in ["links", "events", "clicks"] {
+        files.extend(csv_files(&data.join(d)));
+    }
+    let files = Arc::new(files);
+    let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    const STEP: usize = 512 << 10;
+    for _ in 0..2 {
+        let (files, next) = (files.clone(), next.clone());
+        std::thread::spawn(move || {
+            use std::os::unix::io::AsRawFd;
+            let opened: Vec<Option<(File, usize)>> = files
+                .iter()
+                .map(|p| File::open(p).ok().and_then(|f| f.metadata().ok().map(|m| (f, m.len() as usize))))
+                .collect();
+            // a global sequence of (file, block), claimed one block at a time
+            let blocks: Vec<(usize, usize)> = opened
+                .iter()
+                .enumerate()
+                .flat_map(|(i, o)| {
+                    let n = o.as_ref().map(|x| x.1).unwrap_or(0);
+                    (0..n.div_ceil(STEP)).map(move |b| (i, b * STEP))
+                })
+                .collect();
+            loop {
+                let k = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&(i, off)) = blocks.get(k) else { break };
+                if let Some((f, _)) = &opened[i] {
+                    unsafe { libc::readahead(f.as_raw_fd(), off as i64, STEP) };
+                }
+            }
+        });
+    }
 }
 
 fn small_csv<const N: usize>(path: &Path) -> Vec<[Vec<u8>; N]> {
@@ -264,7 +314,10 @@ struct PTab {
 impl PTab {
     fn new(pairs: &[(u64, u64)]) -> Self {
         let cap = (pairs.len() * 2).next_power_of_two().max(16);
-        let mut slots = vec![(0u64, 0u64); cap];
+        // filled by real writes, not a zeroed allocation: probing reads untouched pages, which
+        // would map the shared zero page and cost a TLB flush on every CPU at the first write
+        let mut slots: Vec<(u64, u64)> = Vec::with_capacity(cap);
+        slots.resize(cap, (0, 0));
         let mask = cap - 1;
         for &(k, v) in pairs {
             let mut i = Self::home(k, mask);
@@ -535,6 +588,9 @@ fn main() {
 
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(data.join("manifest.json")).expect("manifest")).expect("json");
+    if std::env::var_os("NO_READAHEAD").is_none() {
+        start_readahead(&data);
+    }
     let ws = parse_ts(manifest["window_start"].as_str().unwrap().as_bytes());
     let we = parse_ts(manifest["window_end"].as_str().unwrap().as_bytes());
 
@@ -743,7 +799,7 @@ fn main() {
     // Links do not depend on events, so both run at once.
     let (person, parsed) = rayon::join(links_job, events_job);
     lap("links + events parsed");
-    let pmap = |k: u64| -> u64 { person.get(k) };
+
 
     if BAIL.load(Ordering::Relaxed) {
         std::process::exit(3);
@@ -806,12 +862,21 @@ fn main() {
     (0..NB).into_par_iter().for_each(|b| {
         cvb.with(|out| {
             // copies of a click are identical: keep any one
+            let mut kept: Vec<Cl> = Vec::with_capacity(1024);
             dedup_bucket(&cparsed, b, |c: &Cl| c.ck, |_| 0, |&c| {
                 if c.pk != 0 && c.ts != BAD_TS && c.ts >= ws - WEEK && c.ts < we && c.camp != NO_CAMP {
-                    let pk = pmap(c.pk);
-                    out[bucket_of(pk)].push(Cl { pk, ..c });
+                    kept.push(c);
                 }
             });
+            const PF: usize = 16;
+            for i in 0..kept.len() {
+                if i + PF < kept.len() {
+                    person.prefetch(kept[i + PF].pk);
+                }
+                let c = kept[i];
+                let pk = person.get(c.pk);
+                out[bucket_of(pk)].push(Cl { pk, ..c });
+            }
         })
     });
     std::mem::forget(cparsed);
@@ -834,7 +899,11 @@ fn main() {
         .map(|_| {
             std::sync::Mutex::new(Acc {
                 rows: Vec::with_capacity(n_ev / 8 / nt + 16),
-                camp: vec![[0i64; 4]; ncamp * ndays],
+                camp: {
+                    let mut v = Vec::with_capacity(ncamp * ndays);
+                    v.resize(ncamp * ndays, [0i64; 4]); // real writes (see PTab::new)
+                    v
+                },
                 stamp: vec![0u64; ncamp],
                 stamp_id: 0,
                 cat_rev: vec![0i64; ncat_slots],
@@ -977,6 +1046,8 @@ fn main() {
         std::process::exit(3);
     }
     lap("written");
+    // Every file is written and closed; skip tearing down the heap and the thread pool.
+    unsafe { libc::_exit(0) }
 }
 
 #[inline]
