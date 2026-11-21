@@ -14,13 +14,73 @@ use std::sync::atomic::Ordering;
 
 const GAP: i64 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
-const NS: usize = 256; // shards
 const CHUNK: usize = 4 << 20;
 const UNKNOWN_CAT: u8 = 254;
 const NO_CAMP: u16 = u16::MAX;
 
+/// The system allocator for ordinary allocations; anything of 4 MB or more gets its own mapping with
+/// 2 MB transparent huge pages requested (madvise), so big buffers fault in 512x fewer pages.
+/// If THP is off on the host the hint is ignored.
+struct Alloc;
+const BIG: usize = 4 << 20;
+const HUGE: usize = 2 << 20;
+
+unsafe impl std::alloc::GlobalAlloc for Alloc {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        if l.size() >= BIG && l.align() <= 4096 {
+            let n = (l.size() + HUGE - 1) & !(HUGE - 1);
+            let p = unsafe { libc::mmap(std::ptr::null_mut(), n, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+            if p == libc::MAP_FAILED {
+                return std::ptr::null_mut();
+            }
+            unsafe { libc::madvise(p, n, libc::MADV_HUGEPAGE) };
+            return p as *mut u8;
+        }
+        unsafe { std::alloc::System.alloc(l) }
+    }
+    unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
+        if l.size() >= BIG && l.align() <= 4096 {
+            return unsafe { self.alloc(l) }; // fresh anonymous mappings are zero
+        }
+        unsafe { std::alloc::System.alloc_zeroed(l) }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        if l.size() >= BIG && l.align() <= 4096 {
+            let n = (l.size() + HUGE - 1) & !(HUGE - 1);
+            unsafe { libc::munmap(p as *mut libc::c_void, n) };
+            return;
+        }
+        unsafe { std::alloc::System.dealloc(p, l) }
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new: usize) -> *mut u8 {
+        let (old_big, new_big) = (l.size() >= BIG && l.align() <= 4096, new >= BIG && l.align() <= 4096);
+        if !old_big && !new_big {
+            return unsafe { std::alloc::System.realloc(p, l, new) };
+        }
+        if old_big && new_big {
+            let (on, nn) = ((l.size() + HUGE - 1) & !(HUGE - 1), (new + HUGE - 1) & !(HUGE - 1));
+            if nn <= on {
+                return p;
+            }
+            let q = unsafe { libc::mremap(p as *mut libc::c_void, on, nn, libc::MREMAP_MAYMOVE) };
+            if q == libc::MAP_FAILED {
+                return std::ptr::null_mut();
+            }
+            unsafe { libc::madvise(q, nn, libc::MADV_HUGEPAGE) };
+            return q as *mut u8;
+        }
+        let nl = unsafe { std::alloc::Layout::from_size_align_unchecked(new, l.align()) };
+        let q = unsafe { self.alloc(nl) };
+        if !q.is_null() {
+            unsafe { std::ptr::copy_nonoverlapping(p, q, l.size().min(new)) };
+            unsafe { self.dealloc(p, l) };
+        }
+        q
+    }
+}
+
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: Alloc = Alloc;
 
 
 mod parse;
@@ -163,6 +223,290 @@ struct UserRow {
     top: Option<u8>,
 }
 
+
+/// Per-thread sets of `NB` buckets: each rayon worker appends to its own buckets, so there is
+/// no per-chunk allocation and nothing to concatenate; a bucket is read across all threads.
+const NB: usize = 1024;
+
+#[inline]
+fn bucket_of(x: u64) -> usize {
+    (x.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 54) as usize
+}
+
+struct Buckets<T> {
+    v: Vec<std::sync::Mutex<Vec<Vec<T>>>>,
+}
+
+impl<T: Send> Buckets<T> {
+    fn new(cap: usize) -> Self {
+        let nt = rayon::current_num_threads().max(1);
+        Buckets {
+            v: (0..nt).map(|_| std::sync::Mutex::new((0..NB).map(|_| Vec::with_capacity(cap)).collect())).collect(),
+        }
+    }
+    fn with<R>(&self, f: impl FnOnce(&mut Vec<Vec<T>>) -> R) -> R {
+        let i = rayon::current_thread_index().unwrap_or(0) % self.v.len();
+        f(&mut self.v[i].lock().unwrap())
+    }
+    fn into_inner(self) -> Vec<Vec<Vec<T>>> {
+        self.v.into_iter().map(|m| m.into_inner().unwrap()).collect()
+    }
+}
+
+/// user code -> person code, open addressing with 16-byte slots; IDs not in it are their own
+/// person. Lookups come in batches with software prefetch, since the table is far bigger than
+/// the caches.
+struct PTab {
+    slots: Vec<(u64, u64)>,
+    mask: usize,
+}
+
+impl PTab {
+    fn new(pairs: &[(u64, u64)]) -> Self {
+        let cap = (pairs.len() * 2).next_power_of_two().max(16);
+        let mut slots = vec![(0u64, 0u64); cap];
+        let mask = cap - 1;
+        for &(k, v) in pairs {
+            let mut i = Self::home(k, mask);
+            while slots[i].0 != 0 && slots[i].0 != k {
+                i = (i + 1) & mask;
+            }
+            slots[i] = (k, v);
+        }
+        PTab { slots, mask }
+    }
+    #[inline(always)]
+    fn home(k: u64, mask: usize) -> usize {
+        (k.wrapping_mul(0xA24B_AED4_963E_E407) >> 24) as usize & mask
+    }
+    #[inline(always)]
+    fn prefetch(&self, k: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let p = self.slots.as_ptr().add(Self::home(k, self.mask)) as *const i8;
+            std::arch::x86_64::_mm_prefetch(p, std::arch::x86_64::_MM_HINT_T0);
+        }
+    }
+    #[inline(always)]
+    fn get(&self, k: u64) -> u64 {
+        let mut i = Self::home(k, self.mask);
+        loop {
+            let (a, b) = self.slots[i];
+            if a == k {
+                return b;
+            }
+            if a == 0 {
+                return k;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
+/// Open-addressing table of (key, ingest, location), reused by each thread across buckets:
+/// clearing warm memory is much cheaper than faulting in fresh pages.
+#[derive(Clone, Copy, Default)]
+struct Slot {
+    key: u64,
+    ingest: i32,
+    loc: u32, // part << 26 | index in that part's bucket
+}
+
+thread_local! {
+    static TABLE: std::cell::RefCell<Vec<Slot>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SCRATCH: std::cell::RefCell<Group> = std::cell::RefCell::new(Group::default());
+}
+
+/// Per-thread scratch for grouping one bucket by person.
+#[derive(Default)]
+struct Group {
+    ev: Vec<Sv>,
+    cl: Vec<Cl>,
+    tab: Vec<(u64, u32)>, // person code -> dense id + 1
+    dense: Vec<u32>,      // dense id of each event
+    start: Vec<u32>,      // first event of each person, then one past the last
+    cstart: Vec<u32>,     // same for clicks
+    ev_out: Vec<Sv>,
+    cl_out: Vec<Cl>,
+    persons: Vec<u64>,
+}
+
+impl Group {
+    /// Groups the bucket's events and clicks by person (counting passes, no global sort) and
+    /// sorts each person's events and clicks by ts.
+    fn build(&mut self) {
+        let n = self.ev.len();
+        let cap = (n * 2).next_power_of_two().max(16);
+        let mask = cap - 1;
+        self.tab.clear();
+        self.tab.resize(cap, (0, 0));
+        self.persons.clear();
+        self.dense.clear();
+        let mut counts: Vec<u32> = std::mem::take(&mut self.start);
+        counts.clear();
+        for e in &self.ev {
+            let k = e.pk;
+            let mut i = (k.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> 24) as usize & mask;
+            let d = loop {
+                let sl = &mut self.tab[i];
+                if sl.0 == k {
+                    break sl.1 - 1;
+                }
+                if sl.0 == 0 {
+                    let d = self.persons.len() as u32;
+                    *sl = (k, d + 1);
+                    self.persons.push(k);
+                    counts.push(0);
+                    break d;
+                }
+                i = (i + 1) & mask;
+            };
+            counts[d as usize] += 1;
+            self.dense.push(d);
+        }
+        let np = self.persons.len();
+        // counts -> start offsets (np + 1 entries)
+        let mut acc = 0u32;
+        for c in counts.iter_mut() {
+            let x = *c;
+            *c = acc;
+            acc += x;
+        }
+        counts.push(acc);
+        self.ev_out.clear();
+        self.ev_out.reserve(n);
+        unsafe { self.ev_out.set_len(n) };
+        {
+            let mut pos: Vec<u32> = counts[..np].to_vec();
+            for (e, &d) in self.ev.iter().zip(&self.dense) {
+                let p = &mut pos[d as usize];
+                self.ev_out[*p as usize] = *e;
+                *p += 1;
+            }
+        }
+        for d in 0..np {
+            let g = &mut self.ev_out[counts[d] as usize..counts[d + 1] as usize];
+            if g.len() > 1 {
+                if g.len() <= 24 {
+                    for a in 1..g.len() {
+                        let x = g[a];
+                        let mut b = a;
+                        while b > 0 && { g[b - 1].ts } > { x.ts } {
+                            g[b] = g[b - 1];
+                            b -= 1;
+                        }
+                        g[b] = x;
+                    }
+                } else {
+                    g.sort_unstable_by_key(|e| e.ts);
+                }
+            }
+        }
+        self.start = counts;
+        // clicks: only persons with events matter
+        let mut ccount = std::mem::take(&mut self.cstart);
+        ccount.clear();
+        ccount.resize(np + 1, 0);
+        self.dense.clear();
+        for c in &self.cl {
+            let k = c.pk;
+            let mut i = (k.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> 24) as usize & mask;
+            let d = loop {
+                let sl = self.tab[i];
+                if sl.0 == k {
+                    break sl.1 - 1;
+                }
+                if sl.0 == 0 {
+                    break u32::MAX;
+                }
+                i = (i + 1) & mask;
+            };
+            self.dense.push(d);
+            if d != u32::MAX {
+                ccount[d as usize] += 1;
+            }
+        }
+        let mut acc = 0u32;
+        for c in ccount.iter_mut() {
+            let x = *c;
+            *c = acc;
+            acc += x;
+        }
+        let total = acc as usize;
+        self.cl_out.clear();
+        self.cl_out.reserve(total);
+        unsafe { self.cl_out.set_len(total) };
+        {
+            let mut pos: Vec<u32> = ccount[..np].to_vec();
+            for (c, &d) in self.cl.iter().zip(&self.dense) {
+                if d != u32::MAX {
+                    let p = &mut pos[d as usize];
+                    self.cl_out[*p as usize] = *c;
+                    *p += 1;
+                }
+            }
+        }
+        for d in 0..np {
+            let g = &mut self.cl_out[ccount[d] as usize..ccount[d + 1] as usize];
+            if g.len() > 1 {
+                g.sort_unstable_by_key(|c| c.ts);
+            }
+        }
+        self.cstart = ccount;
+    }
+}
+
+/// Calls `keep(&T)` once per distinct key over all threads' bucket `b`, choosing the element
+/// with the smallest `rank` (first seen on ties; callers only tie on identical copies).
+fn dedup_bucket<T: Copy>(parts: &[Vec<Vec<T>>], b: usize, key: impl Fn(&T) -> u64, rank: impl Fn(&T) -> i32, mut keep: impl FnMut(&T)) {
+    let n: usize = parts.iter().map(|t| t[b].len()).sum();
+    if n == 0 {
+        return;
+    }
+    if parts.len() > 63 || parts.iter().any(|t| t[b].len() >= 1 << 26) {
+        bail(); // locations would not fit; the fallback pipeline takes over
+        return;
+    }
+    TABLE.with(|t| {
+        let mut tab = t.borrow_mut();
+        let cap = (n * 3 / 2).next_power_of_two().max(16);
+        if tab.len() < cap {
+            tab.resize(cap, Slot::default());
+        }
+        let tab = &mut tab[..cap];
+        tab.fill(Slot::default());
+        let mask = cap - 1;
+        for (pi, part) in parts.iter().enumerate() {
+            for (ei, e) in part[b].iter().enumerate() {
+                let k = key(e);
+                let r = rank(e);
+                let loc = ((pi as u32) << 26) | ei as u32;
+                let mut i = (k.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> 20) as usize & mask;
+                loop {
+                    let sl = &mut tab[i];
+                    if sl.key == 0 {
+                        *sl = Slot { key: k, ingest: r, loc };
+                        break;
+                    }
+                    if sl.key == k {
+                        if r < sl.ingest {
+                            sl.ingest = r;
+                            sl.loc = loc;
+                        }
+                        break;
+                    }
+                    i = (i + 1) & mask;
+                }
+            }
+        }
+        for sl in tab.iter() {
+            if sl.key != 0 {
+                keep(&parts[(sl.loc >> 26) as usize][b][(sl.loc & ((1 << 26) - 1)) as usize]);
+            }
+        }
+    });
+}
+
 fn main() {
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
@@ -273,6 +617,7 @@ fn main() {
     let organic = camp_ids.len() as u16;
     lap("small tables");
 
+    let links_job = || -> PTab {
     // ---------------------------------------------------------- links -> person names
     let link_chunks = chunks(&data.join("links"));
     let link_pairs: Vec<(u128, u128)> = link_chunks
@@ -287,7 +632,6 @@ fn main() {
             v
         })
         .collect();
-    lap("  links parsed");
     // IDs sorted byte-wise: index order = name order, so a root that is always the smaller
     // index is the person's name.
     let mut slots: Vec<(u128, u32)> = link_pairs
@@ -304,11 +648,10 @@ fn main() {
         }
         side[slot as usize] = ids.len() as u32 - 1;
     }
-    drop(slots);
+    std::mem::forget(slots);
     let pairs: Vec<(u32, u32)> = side.chunks_exact(2).map(|c| (c[0], c[1])).collect();
-    drop(side);
-    drop(link_pairs);
-    lap("  links sorted+indexed");
+    std::mem::forget(side);
+    std::mem::forget(link_pairs);
     let mut parent: Vec<u32> = (0..ids.len() as u32).collect();
     fn find(p: &mut [u32], mut x: u32) -> u32 {
         while p[x as usize] != x {
@@ -331,48 +674,29 @@ fn main() {
         parent[i as usize] = r;
     }
     // one map per shard, built in parallel
-    lap("  union-find");
     // Names were chosen on byte-ordered u128 keys; the rest of the pipeline uses code64 codes.
     let codes: Vec<u64> = ids.par_iter().map(|&k| code64(&key_bytes(k))).collect();
-    let mut by_shard: Vec<Vec<u32>> = (0..NS).map(|_| Vec::new()).collect();
-    for (i, &c) in codes.iter().enumerate() {
-        by_shard[shard64(c)].push(i as u32);
-    }
-    let person: Vec<AHashMap<u64, u64>> = by_shard
-        .par_iter()
-        .map(|v| {
-            let mut m = AHashMap::with_capacity(v.len());
-            for &i in v {
-                m.insert(codes[i as usize], codes[parent[i as usize] as usize]);
-            }
-            m
-        })
-        .collect();
-    drop(by_shard);
-    let pmap = |k: u64| -> u64 {
-        match person[shard64(k)].get(&k) {
-            Some(&p) => p,
-            None => k,
-        }
+    let pairs: Vec<(u64, u64)> = (0..codes.len()).map(|i| (codes[i], codes[parent[i] as usize])).collect();
+    let person = PTab::new(&pairs);
+    std::mem::forget(pairs);
+        person
     };
-    lap("links");
-
+    let events_job = || -> Vec<Vec<Vec<Ev>>> {
     // ---------------------------------------------------------- events: parse
     let ev_chunks = chunks(&data.join("events"));
-    lap("events mapped");
-    let parsed: Vec<Vec<Vec<Ev>>> = ev_chunks
-        .par_iter()
-        .map(|c| {
-            let guess = (c.end - c.start) / 70 / NS * 5 / 4 + 16;
-            let mut sh: Vec<Vec<Ev>> = (0..NS).map(|_| Vec::with_capacity(guess)).collect();
+    let bytes: usize = ev_chunks.iter().map(|c| c.end - c.start).sum();
+    let evb: Buckets<Ev> = Buckets::new(bytes / 70 / NB / rayon::current_num_threads().max(1) * 5 / 4 + 16);
+    ev_chunks.par_iter().for_each(|c| {
+        evb.with(|sh| {
+            let mut tsp = TsParser::default();
             for_records::<7>(c, |[eid, uid, ts, ing, et, pid, price]| {
                 if eid.is_empty() {
                     return;
                 }
                 let ek = code64(eid);
                 let uk = if uid.is_empty() { 0 } else { code64(uid) };
-                let t = parse_ts(ts);
-                let ingest = parse_ts(ing);
+                let t = tsp.parse(ts);
+                let ingest = tsp.parse(ing);
                 if ingest == BAD_TS || ingest == i64::MAX || !(ing.len() == 20) {
                     bail(); // ingest_ts is promised to be valid F1
                 }
@@ -402,8 +726,7 @@ fn main() {
                 if ing_rel < i32::MIN as i64 || ing_rel > i32::MAX as i64 {
                     bail();
                 }
-                let h = ek.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                sh[(h >> 56) as usize].push(Ev {
+                sh[bucket_of(ek)].push(Ev {
                     uk,
                     ek,
                     ingest: ing_rel as i32,
@@ -413,71 +736,54 @@ fn main() {
                     ok,
                 });
             });
-            sh
         })
-        .collect();
+    });
+    evb.into_inner()
+    };
+    // Links do not depend on events, so both run at once.
+    let (person, parsed) = rayon::join(links_job, events_job);
+    lap("links + events parsed");
+    let pmap = |k: u64| -> u64 { person.get(k) };
+
     if BAIL.load(Ordering::Relaxed) {
         std::process::exit(3);
     }
     lap("events parsed");
 
-    // events: dedup per shard, validate, map person, reshard by person
-    let parsed = Arc::new(parsed);
-    let survivors: Vec<Vec<Vec<Sv>>> = (0..NS)
-        .into_par_iter()
-        .map(|s| {
-            let total: usize = parsed.iter().map(|c| c[s].len()).sum();
-            // Sub-bucket by more hash bits so each table stays in cache, then keep, per
-            // event_id, the copy with the smallest ingest_ts (equal ingest => identical).
-            const SB: usize = 16;
-            let mut sub: Vec<Vec<Ev>> = (0..SB).map(|_| Vec::with_capacity(total / SB * 9 / 8 + 16)).collect();
-            for c in parsed.iter() {
-                for e in &c[s] {
-                    let h = { e.ek }.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                    sub[((h >> 52) & (SB as u64 - 1)) as usize].push(*e);
-                }
-            }
-            let mut best: AHashMap<u64, Ev> = AHashMap::with_capacity(total / SB * 9 / 8 + 16);
-            let mut kept: Vec<Ev> = Vec::with_capacity(total);
-            for b in &sub {
-                best.clear();
-                for e in b {
-                    match best.entry(e.ek) {
-                        std::collections::hash_map::Entry::Vacant(x) => {
-                            x.insert(*e);
-                        }
-                        std::collections::hash_map::Entry::Occupied(mut x) => {
-                            let (a, b) = (e.ingest, x.get().ingest);
-                            if a < b {
-                                x.insert(*e);
-                            }
-                        }
-                    }
-                }
-                kept.extend(best.values().copied());
-            }
-            drop(sub);
-            let guess = total / NS * 5 / 4 + 16;
-            let mut out: Vec<Vec<Sv>> = (0..NS).map(|_| Vec::with_capacity(guess)).collect();
-            for &e in &kept {
+    // events: dedup per bucket (earliest ingest_ts wins), keep valid copies, move to person buckets
+    let nt = rayon::current_num_threads().max(1);
+    let n_ev: usize = parsed.iter().flatten().map(|b| b.len()).sum();
+    let sv: Buckets<Sv> = Buckets::new(n_ev / NB / nt * 5 / 4 + 16);
+    (0..NB).into_par_iter().for_each(|b| {
+        sv.with(|out| {
+            let mut kept: Vec<Ev> = Vec::with_capacity(4096);
+            dedup_bucket(&parsed, b, |e: &Ev| e.ek, |e: &Ev| e.ingest, |e: &Ev| {
                 if e.ok {
-                    let pk = pmap(e.uk);
-                    out[shard64(pk)].push(Sv { pk, ts: e.ts, price: e.price, cat: e.cat });
+                    kept.push(*e);
                 }
+            });
+            const PF: usize = 16;
+            for i in 0..kept.len() {
+                if i + PF < kept.len() {
+                    person.prefetch(kept[i + PF].uk);
+                }
+                let e = kept[i];
+                let pk = person.get(e.uk);
+                out[bucket_of(pk)].push(Sv { pk, ts: e.ts, price: e.price, cat: e.cat });
             }
-            out
         })
-        .collect();
-    drop(parsed);
+    });
+    std::mem::forget(parsed);
+    let survivors = sv.into_inner();
     lap("events deduped");
 
     // ---------------------------------------------------------- clicks
     let cl_chunks = chunks(&data.join("clicks"));
-    let cparsed: Vec<Vec<Vec<Cl>>> = cl_chunks
-        .par_iter()
-        .map(|c| {
-            let guess = (c.end - c.start) / 45 / NS * 5 / 4 + 16;
-            let mut sh: Vec<Vec<Cl>> = (0..NS).map(|_| Vec::with_capacity(guess)).collect();
+    lap("  clicks mapped");
+    let cb: Buckets<Cl> = Buckets::new(cl_chunks.iter().map(|c| c.end - c.start).sum::<usize>() / 45 / NB / nt * 5 / 4 + 16);
+    cl_chunks.par_iter().for_each(|c| {
+        cb.with(|sh| {
+            let mut tsp = TsParser::default();
             for_records::<4>(c, |[cid, uid, camp, ts]| {
                 if cid.is_empty() {
                     return;
@@ -485,89 +791,78 @@ fn main() {
                 let ck = code64(cid);
                 let uk = if uid.is_empty() { 0 } else { code64(uid) };
                 let cp = if camp.is_empty() { NO_CAMP } else { *campaigns.get(&key_or_miss(camp)).unwrap_or(&NO_CAMP) };
-                let t = parse_ts(ts);
-                sh[shard64(ck)].push(Cl { ck, pk: uk, ts: t, camp: cp });
+                let t = tsp.parse(ts);
+                sh[bucket_of(ck)].push(Cl { ck, pk: uk, ts: t, camp: cp });
             });
-            sh
         })
-        .collect();
+    });
     if BAIL.load(Ordering::Relaxed) {
         std::process::exit(3);
     }
-    let cparsed = Arc::new(cparsed);
-    let cvalid: Vec<Vec<Vec<Cl>>> = (0..NS)
-        .into_par_iter()
-        .map(|s| {
-            let mut v: Vec<Cl> = Vec::with_capacity(cparsed.iter().map(|c| c[s].len()).sum());
-            for c in cparsed.iter() {
-                v.extend_from_slice(&c[s]);
-            }
-            let mut seen: ahash::AHashSet<u64> = ahash::AHashSet::with_capacity(v.len());
-            let mut out: Vec<Vec<Cl>> = (0..NS).map(|_| Vec::new()).collect();
-            for &c in &v {
-                if !seen.insert(c.ck) {
-                    continue; // copies of a click are identical: keep the first
-                }
+    let cparsed = cb.into_inner();
+    lap("  clicks parsed");
+    let n_cl: usize = cparsed.iter().flatten().map(|b| b.len()).sum();
+    let cvb: Buckets<Cl> = Buckets::new(n_cl / NB / nt * 5 / 4 + 16);
+    (0..NB).into_par_iter().for_each(|b| {
+        cvb.with(|out| {
+            // copies of a click are identical: keep any one
+            dedup_bucket(&cparsed, b, |c: &Cl| c.ck, |_| 0, |&c| {
                 if c.pk != 0 && c.ts != BAD_TS && c.ts >= ws - WEEK && c.ts < we && c.camp != NO_CAMP {
                     let pk = pmap(c.pk);
-                    out[shard64(pk)].push(Cl { pk, ..c });
+                    out[bucket_of(pk)].push(Cl { pk, ..c });
                 }
-            }
-            out
+            });
         })
-        .collect();
-    drop(cparsed);
+    });
+    std::mem::forget(cparsed);
+    let cvalid = cvb.into_inner();
     lap("clicks");
 
     // ---------------------------------------------------------- sessions, credit, assists
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1).max(1) as usize;
     let ncamp = camp_ids.len() + 1;
-    let survivors = Arc::new(survivors);
-    let cvalid = Arc::new(cvalid);
-    let results: Vec<(Vec<UserRow>, Vec<[i64; 4]>)> = (0..NS)
-        .into_par_iter()
-        .map(|s| {
-            let mut ev: Vec<Sv> = Vec::with_capacity(survivors.iter().map(|c| c[s].len()).sum());
-            for c in survivors.iter() {
-                ev.extend_from_slice(&c[s]);
+    struct Acc {
+        rows: Vec<UserRow>,
+        camp: Vec<[i64; 4]>,
+        stamp: Vec<u64>,
+        stamp_id: u64,
+        cat_rev: Vec<i64>,
+        touched: Vec<u8>,
+    }
+    let accs: Vec<std::sync::Mutex<Acc>> = (0..nt)
+        .map(|_| {
+            std::sync::Mutex::new(Acc {
+                rows: Vec::with_capacity(n_ev / 8 / nt + 16),
+                camp: vec![[0i64; 4]; ncamp * ndays],
+                stamp: vec![0u64; ncamp],
+                stamp_id: 0,
+                cat_rev: vec![0i64; ncat_slots],
+                touched: vec![],
+            })
+        })
+        .collect();
+    (0..NB).into_par_iter().for_each(|s| {
+        let me = rayon::current_thread_index().unwrap_or(0) % nt;
+        let mut acc = accs[me].lock().unwrap();
+        let Acc { rows, camp, stamp, stamp_id, cat_rev, touched } = &mut *acc;
+        SCRATCH.with(|sc| {
+            let mut g = sc.borrow_mut();
+            g.ev.clear();
+            for t in survivors.iter() {
+                g.ev.extend_from_slice(&t[s]);
             }
-            ev.sort_unstable_by(|a, b| {
-                let (ap, at, bp, bt) = (a.pk, a.ts, b.pk, b.ts);
-                (ap, at).cmp(&(bp, bt))
-            });
-            let mut cl: Vec<Cl> = Vec::with_capacity(cvalid.iter().map(|c| c[s].len()).sum());
-            for c in cvalid.iter() {
-                cl.extend_from_slice(&c[s]);
+            g.cl.clear();
+            for t in cvalid.iter() {
+                g.cl.extend_from_slice(&t[s]);
             }
-            cl.sort_unstable_by(|a, b| {
-                let (ap, at, bp, bt) = (a.pk, a.ts, b.pk, b.ts);
-                (ap, at).cmp(&(bp, bt))
-            });
-
-            let mut rows: Vec<UserRow> = vec![];
-            let mut camp = vec![[0i64; 4]; ncamp * ndays];
-            let mut stamp = vec![0u64; ncamp];
-            let mut stamp_id: u64 = 0;
-            let mut cat_rev = vec![0i64; ncat_slots];
-            let mut touched: Vec<u8> = vec![];
-
-            let mut ci = 0usize;
-            let mut i = 0usize;
-            while i < ev.len() {
-                let pk = ev[i].pk;
-                let mut j = i;
-                while j < ev.len() && { ev[j].pk } == pk {
-                    j += 1;
-                }
-                while ci < cl.len() && { cl[ci].pk } < pk {
-                    ci += 1;
-                }
-                let mut cj = ci;
-                while cj < cl.len() && { cl[cj].pk } == pk {
-                    cj += 1;
-                }
-                let clicks = &cl[ci..cj];
+            g.build();
+            let g = &*g;
+            for d in 0..g.persons.len() {
+                let pk = g.persons[d];
+                let ev = &g.ev_out[g.start[d] as usize..g.start[d + 1] as usize];
+                let clicks = &g.cl_out[g.cstart[d] as usize..g.cstart[d + 1] as usize];
+                let (i, j) = (0usize, ev.len());
                 let (mut lo, mut hi) = (0usize, 0usize);
 
                 // current (person, day) accumulator
@@ -585,7 +880,7 @@ fn main() {
                     let day = start.div_euclid(DAY);
                     if day != cur_day {
                         if cur_day != i64::MIN {
-                            rows.push(finish_row(pk, cur_day, d_sessions, d_events, d_rev, &mut cat_rev, &mut touched, &rank));
+                            rows.push(finish_row(pk, cur_day, d_sessions, d_events, d_rev, cat_rev, touched, &rank));
                         }
                         cur_day = day;
                         d_sessions = 0;
@@ -593,8 +888,10 @@ fn main() {
                         d_rev = 0;
                     }
                     let mut rev = 0i64;
+                    let mut purchased = false;
                     for e in &ev[k..m] {
                         if e.price > 0 {
+                            purchased = true;
                             rev += e.price as i64;
                             let c = e.cat as usize;
                             if cat_rev[c] == 0 {
@@ -603,7 +900,6 @@ fn main() {
                             cat_rev[c] += e.price as i64;
                         }
                     }
-                    let purchased = ev[k..m].iter().any(|e| e.price > 0);
                     d_sessions += 1;
                     d_events += (m - k) as i64;
                     d_rev += rev;
@@ -626,11 +922,11 @@ fn main() {
                             // several clicks at the latest ts: the byte-wise smallest click_id
                             p = (p..hi).min_by(|&a, &b| decode64(clicks[a].ck).cmp(&decode64(clicks[b].ck))).unwrap();
                         }
-                        stamp_id += 1;
+                        *stamp_id += 1;
                         for c in &clicks[lo..hi] {
                             let cc = c.camp as usize;
-                            if stamp[cc] != stamp_id {
-                                stamp[cc] = stamp_id;
+                            if stamp[cc] != *stamp_id {
+                                stamp[cc] = *stamp_id;
                                 camp[cc * ndays + di][3] += 1;
                             }
                         }
@@ -645,23 +941,21 @@ fn main() {
                     k = m;
                 }
                 if cur_day != i64::MIN {
-                    rows.push(finish_row(pk, cur_day, d_sessions, d_events, d_rev, &mut cat_rev, &mut touched, &rank));
+                    rows.push(finish_row(pk, cur_day, d_sessions, d_events, d_rev, cat_rev, touched, &rank));
                 }
-                ci = cj;
-                i = j;
             }
-            (rows, camp)
-        })
-        .collect();
-    drop(survivors);
-    drop(cvalid);
+        });
+    });
+    std::mem::forget(survivors);
+    std::mem::forget(cvalid);
+    let accs: Vec<Acc> = accs.into_iter().map(|m| m.into_inner().unwrap()).collect();
     lap("sessions");
 
     let mut camp_tot = vec![[0i64; 4]; ncamp * ndays];
-    for (_, c) in &results {
-        for (a, b) in camp_tot.iter_mut().zip(c) {
-            for x in 0..4 {
-                a[x] += b[x];
+    for a in &accs {
+        for (x, y) in camp_tot.iter_mut().zip(&a.camp) {
+            for z in 0..4 {
+                x[z] += y[z];
             }
         }
     }
@@ -675,9 +969,8 @@ fn main() {
         if c == UNKNOWN_CAT as usize { b"unknown".to_vec() } else { cat_names.get(c).cloned().unwrap_or_default() }
     }).collect();
 
-    let groups: Vec<&[(Vec<UserRow>, Vec<[i64; 4]>)]> = results.chunks(NS / 8).collect();
-    groups.par_iter().enumerate().for_each(|(g, part)| {
-        write_users(&ud.join(format!("part-{g}.parquet")), part.iter().flat_map(|(r, _)| r.iter()), &names, day0);
+    accs.par_iter().enumerate().for_each(|(g, a)| {
+        write_users(&ud.join(format!("part-{g}.parquet")), a.rows.iter(), &names, day0);
     });
     write_campaigns(&cd.join("part-0.parquet"), &camp_tot, ndays, day0, &camp_ids, &camp_channel, organic);
     if BAIL.load(Ordering::Relaxed) {
@@ -736,8 +1029,11 @@ fn write_users<'a>(path: &Path, rows: impl Iterator<Item = &'a UserRow>, names: 
     let rows: Vec<&UserRow> = rows.collect();
     let mut uid = StringBuilder::with_capacity(rows.len(), rows.len() * 10);
     let mut top = StringBuilder::with_capacity(rows.len(), rows.len() * 8);
+    let mut buf: Vec<u8> = Vec::with_capacity(64);
     for r in &rows {
-        uid.append_value(utf8(&decode64(r.pk)));
+        buf.clear();
+        decode64_into(r.pk, &mut buf);
+        uid.append_value(utf8(&buf));
         match r.top {
             Some(c) => top.append_value(utf8(&names[c as usize])),
             None => top.append_null(),

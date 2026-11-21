@@ -200,6 +200,114 @@ fn parse_iso(b: &[u8], offs: bool) -> i64 {
     ms
 }
 
+/// `parse_ts` with a small cache of "YYYY-MM-DD" -> day number (or invalid), and the time of
+/// day validated and converted with SWAR. Returns exactly what `parse_ts` returns.
+pub struct TsParser {
+    keys: [(u64, u16); 64],
+    days: [i64; 64], // i64::MIN = invalid date
+}
+
+impl Default for TsParser {
+    fn default() -> Self {
+        TsParser { keys: [(0, 0); 64], days: [0; 64] }
+    }
+}
+
+const NO_DATE: i64 = i64::MIN;
+
+impl TsParser {
+    #[inline(always)]
+    pub fn parse(&mut self, b: &[u8]) -> i64 {
+        let n = b.len();
+        let zulu = n == 20 && b[19] == b'Z';
+        let offs = n == 25 && (b[19] == b'+' || b[19] == b'-') && b[22] == b':';
+        if !(zulu || offs) {
+            return if all_digits(b) { digits_value(b) } else { BAD_TS };
+        }
+        if b[10] != b'T' {
+            return BAD_TS;
+        }
+        let k8 = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let k2 = u16::from_le_bytes([b[8], b[9]]);
+        let slot = ((k8 ^ (k2 as u64).rotate_left(29)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize;
+        let days = if self.keys[slot] == (k8, k2) && k8 != 0 {
+            self.days[slot]
+        } else {
+            let d = date_days(&b[0..10]);
+            self.keys[slot] = (k8, k2);
+            self.days[slot] = d;
+            d
+        };
+        if days == NO_DATE {
+            return BAD_TS;
+        }
+        let Some(secs) = hms(u64::from_le_bytes(b[11..19].try_into().unwrap())) else {
+            return BAD_TS;
+        };
+        let mut ms = days * DAY + secs * 1000;
+        if offs {
+            let (Some(oh), Some(om)) = (d2(b, 20), d2(b, 23)) else {
+                return BAD_TS;
+            };
+            if oh > 23 || om > 59 {
+                return BAD_TS;
+            }
+            let off = oh * 3_600_000 + om * 60_000;
+            ms -= if b[19] == b'-' { -off } else { off };
+        }
+        ms
+    }
+}
+
+/// "YYYY-MM-DD" -> days since 1970-01-01, or NO_DATE if malformed or impossible.
+fn date_days(b: &[u8]) -> i64 {
+    if b[4] != b'-' || b[7] != b'-' {
+        return NO_DATE;
+    }
+    let num = |i: usize, k: usize| -> Option<i64> {
+        let mut v = 0;
+        for j in i..i + k {
+            v = v * 10 + dig(b[j])?;
+        }
+        Some(v)
+    };
+    let (Some(y), Some(mo), Some(d)) = (num(0, 4), num(5, 2), num(8, 2)) else {
+        return NO_DATE;
+    };
+    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) {
+        return NO_DATE;
+    }
+    if (Y0..Y0 + NY as i64).contains(&y) {
+        MONTH_START[(y - Y0) as usize * 12 + (mo - 1) as usize] + d - 1
+    } else {
+        days_from_civil(y, mo, d)
+    }
+}
+
+/// "HH:MM:SS" (as 8 little-endian bytes) -> seconds of the day, if well-formed and in range.
+#[inline(always)]
+fn hms(x: u64) -> Option<i64> {
+    const DIGITS: u64 = 0x0000_FF00_00FF_0000 ^ u64::MAX; // all bytes except the two colons
+    // every byte has high nibble 3 ('0'..'9' and ':' all do)
+    if x & 0xF0F0_F0F0_F0F0_F0F0 != 0x3030_3030_3030_3030 {
+        return None;
+    }
+    let lo = x & 0x0F0F_0F0F_0F0F_0F0F;
+    // digit bytes: low nibble <= 9; colon bytes: exactly ':' (low nibble 0xA)
+    if (lo + 0x0606_0606_0606_0606) & 0x1010_1010_1010_1010 & DIGITS != 0 {
+        return None;
+    }
+    if (x >> 16) & 0xFF != b':' as u64 || (x >> 40) & 0xFF != b':' as u64 {
+        return None;
+    }
+    let byte = |i: u32| ((lo >> (8 * i)) & 0xFF) as i64;
+    let (h, m, s) = (byte(0) * 10 + byte(1), byte(3) * 10 + byte(4), byte(6) * 10 + byte(7));
+    if h > 23 || m > 59 || s > 59 {
+        return None;
+    }
+    Some(h * 3600 + m * 60 + s)
+}
+
 #[inline(always)]
 pub fn field(d: &[u8], s: usize, e: usize, q: u32) -> Option<&[u8]> {
     if q == 0 {
@@ -211,43 +319,90 @@ pub fn field(d: &[u8], s: usize, e: usize, q: u32) -> Option<&[u8]> {
     }
 }
 
-/// (separator mask, quote mask) for data[base..base+64]: bit i of the first is set when the
-/// byte is '\n' or ',', bit i of the second when it is '"'.
+/// (comma mask, newline mask, quote mask) for data[base..base+64]: bit i set when that byte
+/// is ',' / '\n' / '"'. Needs base + 64 <= data.len(). SSE2 version (every x86-64 CPU).
 #[inline(always)]
-fn block_masks(data: &[u8], base: usize) -> (u64, u64) {
-    let len = data.len();
-    if base + 64 <= len {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            use std::arch::x86_64::*;
-            let p = data.as_ptr().add(base);
-            let (nl, cm, qt) = (_mm_set1_epi8(b'\n' as i8), _mm_set1_epi8(b',' as i8), _mm_set1_epi8(b'"' as i8));
-            let (mut m, mut q) = (0u64, 0u64);
-            for k in 0..4 {
-                let v = _mm_loadu_si128(p.add(16 * k) as *const __m128i);
-                let x = _mm_or_si128(_mm_cmpeq_epi8(v, nl), _mm_cmpeq_epi8(v, cm));
-                m |= ((_mm_movemask_epi8(x) as u32) as u64) << (16 * k);
-                q |= ((_mm_movemask_epi8(_mm_cmpeq_epi8(v, qt)) as u32) as u64) << (16 * k);
-            }
-            return (m, q);
+fn masks_sse(data: &[u8], base: usize) -> (u64, u64, u64) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let p = data.as_ptr().add(base);
+        let (nl, cm, qt) = (_mm_set1_epi8(b'\n' as i8), _mm_set1_epi8(b',' as i8), _mm_set1_epi8(b'"' as i8));
+        let (mut c, mut n, mut q) = (0u64, 0u64, 0u64);
+        for k in 0..4 {
+            let v = _mm_loadu_si128(p.add(16 * k) as *const __m128i);
+            c |= ((_mm_movemask_epi8(_mm_cmpeq_epi8(v, cm)) as u32) as u64) << (16 * k);
+            n |= ((_mm_movemask_epi8(_mm_cmpeq_epi8(v, nl)) as u32) as u64) << (16 * k);
+            q |= ((_mm_movemask_epi8(_mm_cmpeq_epi8(v, qt)) as u32) as u64) << (16 * k);
         }
+        (c, n, q)
     }
-    let (mut m, mut q) = (0u64, 0u64);
-    for i in 0..(len - base).min(64) {
+    #[cfg(not(target_arch = "x86_64"))]
+    masks_tail(data, base)
+}
+
+/// Same masks with one AVX-512 compare per byte class (Cascade Lake and newer Xeons).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx512bw")]
+unsafe fn masks_512(data: &[u8], base: usize) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let v = _mm512_loadu_si512(data.as_ptr().add(base) as *const _);
+        (
+            _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)),
+            _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8)),
+            _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8)),
+        )
+    }
+}
+
+/// Masks for the last, partial block (scalar).
+#[inline(never)]
+fn masks_tail(data: &[u8], base: usize) -> (u64, u64, u64) {
+    let (mut c, mut n, mut q) = (0u64, 0u64, 0u64);
+    for i in 0..(data.len() - base).min(64) {
         match data[base + i] {
-            b'\n' | b',' => m |= 1 << i,
+            b',' => c |= 1 << i,
+            b'\n' => n |= 1 << i,
             b'"' => q |= 1 << i,
             _ => {}
         }
     }
-    (m, q)
+    (c, n, q)
 }
+
+static HAS_512: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("avx512bw") && std::env::var_os("NO_AVX512").is_none()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+});
 
 /// Every well-formed record of `data` as N fields, skipping malformed and empty lines.
 /// Separators are found 64 bytes at a time with SIMD; quotes per field are counted with a
 /// running popcount, so the loop stops only at commas and newlines.
 #[inline]
-pub fn records<const N: usize>(data: &[u8], mut f: impl FnMut([&[u8]; N])) {
+pub fn records<const N: usize>(data: &[u8], f: impl FnMut([&[u8]; N])) {
+    #[cfg(target_arch = "x86_64")]
+    if *HAS_512 {
+        return unsafe { records_512::<N>(data, f) };
+    }
+    records_impl::<N, false>(data, f)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn records_512<const N: usize>(data: &[u8], f: impl FnMut([&[u8]; N])) {
+    records_impl::<N, true>(data, f)
+}
+
+#[inline(always)]
+fn records_impl<const N: usize, const W: bool>(data: &[u8], mut f: impl FnMut([&[u8]; N])) {
     let empty: &[u8] = &data[..0];
     let mut out: [&[u8]; N] = [empty; N];
     let (mut n, mut start, mut line_start, mut bad) = (0usize, 0usize, 0usize, false);
@@ -256,33 +411,39 @@ pub fn records<const N: usize>(data: &[u8], mut f: impl FnMut([&[u8]; N])) {
     let mut q_before_block: u32 = 0; // quotes in data[..base]
     let mut q_at_start: u32 = 0; // quotes in data[..start]
     while base < len {
-        let (mut m, qm) = block_masks(data, base);
+        let (cm, nm, qm) = if base + 64 <= len {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if W { unsafe { masks_512(data, base) } } else { masks_sse(data, base) }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                masks_sse(data, base)
+            }
+        } else {
+            masks_tail(data, base)
+        };
+        let mut m = cm | nm;
         while m != 0 {
             let i = m.trailing_zeros();
             m &= m - 1;
             let p = base + i as usize;
-            let q_here = q_before_block + (qm & ((1u64 << i) - 1)).count_ones();
+            let q_here = if qm == 0 { q_before_block } else { q_before_block + (qm & ((1u64 << i) - 1)).count_ones() };
             let q = q_here - q_at_start;
-            if data[p] == b',' {
-                if !bad {
-                    if n + 1 >= N {
-                        bad = true;
-                    } else {
-                        match field(data, start, p, q) {
-                            Some(v) => {
-                                out[n] = v;
-                                n += 1;
-                            }
-                            None => bad = true,
-                        }
-                    }
-                }
+            // Field data[start..p], branch-free: valid when it has no quotes, or exactly two
+            // that wrap the whole field (and it is at least 2 bytes long).
+            let flen = p - start;
+            let wrapped = (q == 2) & (flen >= 2) & (data[start] == b'"') & (data[p.saturating_sub(1)] == b'"');
+            let valid = (q == 0) | wrapped;
+            let w = wrapped as usize;
+            let slot = if n < N { n } else { N - 1 };
+            out[slot] = &data[start + w..p - w];
+            if (cm >> i) & 1 == 1 {
+                bad |= !valid | (n + 1 >= N);
+                n += 1;
             } else {
-                if !bad && p > line_start && n + 1 == N {
-                    if let Some(v) = field(data, start, p, q) {
-                        out[n] = v;
-                        f(out);
-                    }
+                if !bad & valid & (p > line_start) & (n + 1 == N) {
+                    f(out);
                 }
                 n = 0;
                 line_start = p + 1;
@@ -361,6 +522,25 @@ fn intern(b: &[u8]) -> u64 {
     m.bytes.push(b.to_vec());
     m.code.insert(b.to_vec(), c);
     c
+}
+
+/// Appends the bytes of a `code64` code to `out`.
+#[inline]
+pub fn decode64_into(c: u64, out: &mut Vec<u8>) {
+    if c >> 63 == 1 {
+        let m = INTERN.lock().unwrap();
+        out.extend_from_slice(&m.bytes[(c & !(1u64 << 63)) as usize]);
+        return;
+    }
+    let n = (64 - c.leading_zeros() as usize).div_ceil(6);
+    for i in (0..n).rev() {
+        let d = ((c >> (6 * i)) & 63) as u8;
+        out.push(match d {
+            1..=10 => b'0' + d - 1,
+            11..=36 => b'A' + d - 11,
+            _ => b'a' + d - 37,
+        });
+    }
 }
 
 /// The bytes of a `code64` code.
@@ -489,6 +669,9 @@ mod tests {
         let codes: Vec<u64> = ids.iter().map(|b| code64(b)).collect();
         for (i, a) in codes.iter().enumerate() {
             assert_eq!(decode64(*a), ids[i].to_vec());
+            let mut v = b"x".to_vec();
+            decode64_into(*a, &mut v);
+            assert_eq!(&v[1..], ids[i]);
             for b in &codes[i + 1..] {
                 assert_ne!(a, b);
             }
@@ -503,6 +686,45 @@ mod tests {
         by_key.sort_by_key(|b| key(b));
         ids.sort();
         assert_eq!(by_key, ids);
+    }
+
+    #[test]
+    fn ts_parser_matches_parse_ts() {
+        // every valid and bad form, then many random mutations of them
+        let mut cases: Vec<Vec<u8>> = vec![];
+        let seeds: [&[u8]; 8] = [
+            b"2026-10-03T23:58:10Z",
+            b"2026-10-03T19:58:10-04:00",
+            b"2028-02-29T00:00:00+12:00",
+            b"2027-02-28T23:59:59-10:00",
+            b"1791071890000",
+            b"2026-10-03T24:00:00Z",
+            b"2026-02-30T10:00:00Z",
+            b"2026-10-03T10:00:00+05:60",
+        ];
+        let alphabet = b"0123456789:-+TZtz .9/";
+        let mut r: u64 = 0x1234_5678_9abc_def1;
+        let mut next = || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        for s in seeds {
+            cases.push(s.to_vec());
+            for _ in 0..4000 {
+                let mut v = s.to_vec();
+                for _ in 0..(next() % 3 + 1) {
+                    let i = (next() as usize) % v.len();
+                    v[i] = alphabet[(next() as usize) % alphabet.len()];
+                }
+                cases.push(v);
+            }
+        }
+        let mut p = TsParser::default();
+        for c in cases.iter().chain(cases.iter()) {
+            assert_eq!(p.parse(c), parse_ts(c), "{:?}", String::from_utf8_lossy(c));
+        }
     }
 
     #[test]
