@@ -10,183 +10,41 @@ use rayon::prelude::*;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
-const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
-const BAD_TS: i64 = i64::MIN;
 const NS: usize = 256; // shards
 const CHUNK: usize = 4 << 20;
 const UNKNOWN_CAT: u8 = 254;
 const NO_CAMP: u16 = u16::MAX;
 
-static BAIL: AtomicBool = AtomicBool::new(false);
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-fn bail() {
-    BAIL.store(true, Ordering::Relaxed);
-}
 
-// ------------------------------------------------------------------ keys
-
-#[inline]
-fn key(b: &[u8]) -> u128 {
-    if b.len() > 15 {
-        bail();
-        return 1; // never used: we exit before producing output
-    }
-    let mut buf = [0u8; 16];
-    buf[..b.len()].copy_from_slice(b);
-    buf[15] = b.len() as u8;
-    u128::from_be_bytes(buf)
-}
-
-fn key_bytes(k: u128) -> Vec<u8> {
-    let b = k.to_be_bytes();
-    b[..b[15] as usize].to_vec()
-}
-
-#[inline]
-fn shard_of(k: u128) -> usize {
-    let x = (k as u64) ^ ((k >> 64) as u64).rotate_left(17);
-    (x.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize
-}
-
-// ------------------------------------------------------------------ CSV
-
-/// Splits one line into exactly N fields with the rules' dialect. None = malformed.
-/// An empty field (or "") is returned as an empty slice, meaning null. One pass over the bytes.
-#[inline]
-fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
-    let mut out: [&[u8]; N] = [&[]; N];
-    let mut n = 0usize;
-    let mut start = 0usize;
-    let mut quotes = 0u32; // quotes seen in the current field
-    let len = line.len();
-    let mut i = 0usize;
-    while i <= len {
-        let c = if i < len { line[i] } else { b',' };
-        if c == b',' {
-            if n == N {
-                return None;
-            }
-            let f = &line[start..i];
-            out[n] = if quotes == 0 {
-                f
-            } else if quotes == 2 && f.len() >= 2 && f[0] == b'"' && f[f.len() - 1] == b'"' {
-                &f[1..f.len() - 1]
-            } else {
-                return None;
-            };
-            n += 1;
-            start = i + 1;
-            quotes = 0;
-        } else if c == b'"' {
-            quotes += 1;
-        }
-        i += 1;
-    }
-    if n == N && len > 0 { Some(out) } else { None }
-}
-
-// ------------------------------------------------------------------ numbers and time
-
-#[inline]
-fn all_digits(b: &[u8]) -> bool {
-    !b.is_empty() && b.iter().all(|c| c.is_ascii_digit())
-}
-
-/// Digits only, leading zeros allowed. Values over 18 significant digits return i64::MAX.
-#[inline]
-fn digits_value(b: &[u8]) -> i64 {
-    let mut i = 0;
-    while i < b.len() && b[i] == b'0' {
-        i += 1;
-    }
-    if b.len() - i > 18 {
-        return i64::MAX;
-    }
-    let mut v: i64 = 0;
-    for &c in &b[i..] {
-        v = v * 10 + (c - b'0') as i64;
-    }
-    v
-}
-
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
-fn days_in_month(y: i64, m: i64) -> i64 {
-    match m {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        _ => {
-            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 29 } else { 28 }
-        }
-    }
-}
-
-#[inline]
-fn d2(b: &[u8], i: usize) -> Option<i64> {
-    let (a, c) = (b[i], b[i + 1]);
-    if a.is_ascii_digit() && c.is_ascii_digit() {
-        Some(((a - b'0') * 10 + (c - b'0')) as i64)
-    } else {
-        None
-    }
-}
-
-/// F1 / F2 / F3 -> epoch ms; BAD_TS when bad.
-fn parse_ts(b: &[u8]) -> i64 {
-    if b.is_empty() {
-        return BAD_TS;
-    }
-    if all_digits(b) {
-        return digits_value(b);
-    }
-    let n = b.len();
-    let zulu = n == 20 && b[19] == b'Z';
-    let offs = n == 25 && (b[19] == b'+' || b[19] == b'-') && b[22] == b':';
-    if !(zulu || offs) {
-        return BAD_TS;
-    }
-    if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
-        return BAD_TS;
-    }
-    let (Some(y1), Some(y2), Some(mo), Some(d), Some(h), Some(mi), Some(s)) =
-        (d2(b, 0), d2(b, 2), d2(b, 5), d2(b, 8), d2(b, 11), d2(b, 14), d2(b, 17))
-    else {
-        return BAD_TS;
-    };
-    let y = y1 * 100 + y2;
-    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) || h > 23 || mi > 59 || s > 59 {
-        return BAD_TS;
-    }
-    let mut ms = days_from_civil(y, mo, d) * DAY + h * 3_600_000 + mi * 60_000 + s * 1000;
-    if offs {
-        let (Some(oh), Some(om)) = (d2(b, 20), d2(b, 23)) else {
-            return BAD_TS;
-        };
-        if oh > 23 || om > 59 {
-            return BAD_TS;
-        }
-        let off = oh * 3_600_000 + om * 60_000;
-        ms -= if b[19] == b'-' { -off } else { off };
-    }
-    ms
-}
+mod parse;
+use parse::*;
 
 // ------------------------------------------------------------------ files
 
+enum Src {
+    M(Mmap),
+    V(Vec<u8>),
+}
+
+impl std::ops::Deref for Src {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Src::M(m) => m,
+            Src::V(v) => v,
+        }
+    }
+}
+
 struct Chunk {
-    map: Arc<Mmap>,
+    map: Arc<Src>,
     start: usize,
     end: usize,
 }
@@ -205,45 +63,47 @@ fn csv_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Data region of each file (header line skipped), cut into chunks at '\n'.
+/// Files are mapped (and pre-faulted) in parallel.
 fn chunks(dir: &Path) -> Vec<Chunk> {
-    let mut out = vec![];
-    for p in csv_files(dir) {
-        let f = File::open(&p).expect("open");
-        if f.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
-            continue;
-        }
-        let map = Arc::new(unsafe { Mmap::map(&f).expect("mmap") });
-        let data: &[u8] = &map;
-        let Some(h) = data.iter().position(|&c| c == b'\n') else { continue };
-        let mut s = h + 1;
-        while s < data.len() {
-            let mut e = (s + CHUNK).min(data.len());
-            if e < data.len() {
-                e = match data[e..].iter().position(|&c| c == b'\n') {
-                    Some(p) => e + p + 1,
-                    None => data.len(),
-                };
+    let files = csv_files(dir);
+    let per_file: Vec<Vec<Chunk>> = files
+        .par_iter()
+        .map(|p| {
+            let mut out = vec![];
+            let f = File::open(p).expect("open");
+            if f.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+                return out;
             }
-            out.push(Chunk { map: map.clone(), start: s, end: e });
-            s = e;
-        }
-    }
-    out
+            let map = Arc::new(if std::env::var("READ").is_ok() {
+                Src::V(fs::read(p).expect("read"))
+            } else {
+                Src::M(unsafe { memmap2::MmapOptions::new().populate().map(&f).expect("mmap") })
+            });
+            let data: &[u8] = &map;
+            let Some(h) = memchr::memchr(b'\n', data) else { return out };
+            let mut s = h + 1;
+            while s < data.len() {
+                let mut e = (s + CHUNK).min(data.len());
+                if e < data.len() {
+                    e = match memchr::memchr(b'\n', &data[e..]) {
+                        Some(p) => e + p + 1,
+                        None => data.len(),
+                    };
+                }
+                out.push(Chunk { map: map.clone(), start: s, end: e });
+                s = e;
+            }
+            out
+        })
+        .collect();
+    per_file.into_iter().flatten().collect()
 }
 
-/// Lines of a chunk; empty lines (malformed) are skipped, as is the empty tail after the last '\n'.
-fn for_lines(c: &Chunk, mut f: impl FnMut(&[u8])) {
-    let data = &c.map[c.start..c.end];
-    let mut s = 0;
-    for e in memchr::memchr_iter(b'\n', data) {
-        if e > s {
-            f(&data[s..e]);
-        }
-        s = e + 1;
-    }
-    if s < data.len() {
-        f(&data[s..]);
-    }
+/// Every well-formed record of a chunk as N fields (see `fields`), in one SIMD pass that
+/// finds all '\n', ',' and '"' bytes. Malformed and empty lines are skipped.
+#[inline]
+fn for_records<const N: usize>(c: &Chunk, f: impl FnMut([&[u8]; N])) {
+    records::<N>(&c.map[c.start..c.end], f)
 }
 
 fn small_csv<const N: usize>(path: &Path) -> Vec<[Vec<u8>; N]> {
@@ -261,35 +121,41 @@ fn small_csv<const N: usize>(path: &Path) -> Vec<[Vec<u8>; N]> {
 
 // ------------------------------------------------------------------ records
 
+/// One parsed copy of an event (32 bytes). `ok`: this copy is valid and not late.
 #[derive(Clone, Copy)]
+#[repr(C, packed(4))]
 struct Ev {
-    ek: u128,
-    uk: u128,
-    ts: i64,
-    ingest: i64,
+    uk: u64,
+    ek: u64,
+    ingest: i32, // seconds from window_start
+    ts: u32,     // ms from window_start (valid copies only)
     price: u32,
     cat: u8,
     ok: bool,
 }
 
+/// A surviving event (20 bytes).
 #[derive(Clone, Copy)]
+#[repr(C, packed(4))]
 struct Sv {
-    pk: u128,
-    ts: i64,
+    pk: u64,
+    ts: u32,    // ms from window_start
     price: u32, // 0 = not a purchase
     cat: u8,
 }
 
+/// A click (28 bytes). IDs are `code64` codes.
 #[derive(Clone, Copy)]
+#[repr(C, packed(4))]
 struct Cl {
-    ck: u128,
-    pk: u128, // user key at parse time, person key after mapping
+    ck: u64,
+    pk: u64, // user code at parse time, person code after mapping
     ts: i64,
     camp: u16,
 }
 
 struct UserRow {
-    pk: u128,
+    pk: u64,
     day: i32,
     sessions: i64,
     events: i64,
@@ -307,9 +173,19 @@ fn main() {
     }
     let t0 = std::time::Instant::now();
     let verbose = std::env::var("VERBOSE").is_ok();
+    let cpu = || -> f64 {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+        let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+        tv(ru.ru_utime) + tv(ru.ru_stime)
+    };
+    let last = std::cell::Cell::new((0.0f64, 0.0f64));
     let lap = |what: &str| {
         if verbose {
-            eprintln!("{:8.3}s {}", t0.elapsed().as_secs_f64(), what);
+            let (w, c) = (t0.elapsed().as_secs_f64(), cpu());
+            let (lw, lc) = last.get();
+            eprintln!("{:7.3}s wall {:7.3}s cpu  {}", w - lw, c - lc, what);
+            last.set((w, c));
         }
     };
 
@@ -335,6 +211,31 @@ fn main() {
         });
         products.insert(key(&p), ix);
     }
+    // Fast path for IDs of the form p<digits> with no leading zero: a direct table.
+    let canon = |p: &[u8]| -> Option<usize> {
+        if p.len() >= 2 && p.len() <= 8 && p[0] == b'p' && p[1] != b'0' && p[1..].iter().all(|c| c.is_ascii_digit()) {
+            Some(p[1..].iter().fold(0usize, |v, &c| v * 10 + (c - b'0') as usize))
+        } else {
+            None
+        }
+    };
+    let mut pdirect: Vec<u8> = vec![];
+    for (&k, &c) in &products {
+        if let Some(n) = canon(&key_bytes(k)) {
+            if n < 4_000_000 {
+                if pdirect.len() <= n {
+                    pdirect.resize(n + 1, UNKNOWN_CAT);
+                }
+                pdirect[n] = c;
+            }
+        }
+    }
+    let product_cat = |p: &[u8]| -> u8 {
+        if let Some(n) = canon(p) {
+            return if n < pdirect.len() { pdirect[n] } else { UNKNOWN_CAT };
+        }
+        *products.get(&key_or_miss(p)).unwrap_or(&UNKNOWN_CAT)
+    };
     if cat_names.len() >= UNKNOWN_CAT as usize {
         bail();
     }
@@ -378,26 +279,36 @@ fn main() {
         .par_iter()
         .flat_map_iter(|c| {
             let mut v = vec![];
-            for_lines(c, |l| {
-                if let Some([a, b]) = fields::<2>(l) {
-                    if !a.is_empty() && !b.is_empty() {
-                        v.push((key(a), key(b)));
-                    }
+            for_records::<2>(c, |[a, b]| {
+                if !a.is_empty() && !b.is_empty() {
+                    v.push((key(a), key(b)));
                 }
             });
             v
         })
         .collect();
+    lap("  links parsed");
     // IDs sorted byte-wise: index order = name order, so a root that is always the smaller
     // index is the person's name.
-    let mut ids: Vec<u128> = link_pairs.par_iter().flat_map_iter(|&(a, b)| [a, b]).collect();
-    ids.par_sort_unstable();
-    ids.dedup();
-    let pairs: Vec<(u32, u32)> = link_pairs
+    let mut slots: Vec<(u128, u32)> = link_pairs
         .par_iter()
-        .map(|&(a, b)| (ids.binary_search(&a).unwrap() as u32, ids.binary_search(&b).unwrap() as u32))
+        .enumerate()
+        .flat_map_iter(|(i, &(a, b))| [(a, 2 * i as u32), (b, 2 * i as u32 + 1)])
         .collect();
+    slots.par_sort_unstable();
+    let mut ids: Vec<u128> = Vec::with_capacity(slots.len() / 2);
+    let mut side: Vec<u32> = vec![0; slots.len()];
+    for &(k, slot) in &slots {
+        if ids.last() != Some(&k) {
+            ids.push(k);
+        }
+        side[slot as usize] = ids.len() as u32 - 1;
+    }
+    drop(slots);
+    let pairs: Vec<(u32, u32)> = side.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+    drop(side);
     drop(link_pairs);
+    lap("  links sorted+indexed");
     let mut parent: Vec<u32> = (0..ids.len() as u32).collect();
     fn find(p: &mut [u32], mut x: u32) -> u32 {
         while p[x as usize] != x {
@@ -420,38 +331,46 @@ fn main() {
         parent[i as usize] = r;
     }
     // one map per shard, built in parallel
+    lap("  union-find");
+    // Names were chosen on byte-ordered u128 keys; the rest of the pipeline uses code64 codes.
+    let codes: Vec<u64> = ids.par_iter().map(|&k| code64(&key_bytes(k))).collect();
     let mut by_shard: Vec<Vec<u32>> = (0..NS).map(|_| Vec::new()).collect();
-    for (i, &k) in ids.iter().enumerate() {
-        by_shard[shard_of(k)].push(i as u32);
+    for (i, &c) in codes.iter().enumerate() {
+        by_shard[shard64(c)].push(i as u32);
     }
-    let person: Vec<AHashMap<u128, u128>> = by_shard
+    let person: Vec<AHashMap<u64, u64>> = by_shard
         .par_iter()
         .map(|v| {
             let mut m = AHashMap::with_capacity(v.len());
             for &i in v {
-                m.insert(ids[i as usize], ids[parent[i as usize] as usize]);
+                m.insert(codes[i as usize], codes[parent[i as usize] as usize]);
             }
             m
         })
         .collect();
     drop(by_shard);
-    let pmap = |k: u128| -> u128 { *person[shard_of(k)].get(&k).unwrap_or(&k) };
+    let pmap = |k: u64| -> u64 {
+        match person[shard64(k)].get(&k) {
+            Some(&p) => p,
+            None => k,
+        }
+    };
     lap("links");
 
     // ---------------------------------------------------------- events: parse
     let ev_chunks = chunks(&data.join("events"));
+    lap("events mapped");
     let parsed: Vec<Vec<Vec<Ev>>> = ev_chunks
         .par_iter()
         .map(|c| {
             let guess = (c.end - c.start) / 70 / NS * 5 / 4 + 16;
             let mut sh: Vec<Vec<Ev>> = (0..NS).map(|_| Vec::with_capacity(guess)).collect();
-            for_lines(c, |l| {
-                let Some([eid, uid, ts, ing, et, pid, price]) = fields::<7>(l) else { return };
+            for_records::<7>(c, |[eid, uid, ts, ing, et, pid, price]| {
                 if eid.is_empty() {
                     return;
                 }
-                let ek = key(eid);
-                let uk = if uid.is_empty() { 0 } else { key(uid) };
+                let ek = code64(eid);
+                let uk = if uid.is_empty() { 0 } else { code64(uid) };
                 let t = parse_ts(ts);
                 let ingest = parse_ts(ing);
                 if ingest == BAD_TS || ingest == i64::MAX || !(ing.len() == 20) {
@@ -463,7 +382,7 @@ fn main() {
                     b"purchase" => 2,
                     _ => 255,
                 };
-                let cat = if pid.is_empty() { 255 } else { *products.get(&key_or_miss(pid)).unwrap_or(&UNKNOWN_CAT) };
+                let cat = if pid.is_empty() { 255 } else { product_cat(pid) };
                 let mut pr: u32 = 0;
                 if etc == 2 && all_digits(price) {
                     let v = digits_value(price);
@@ -477,8 +396,22 @@ fn main() {
                     && t < we
                     && etc != 255
                     && cat != 255
-                    && (etc != 2 || pr > 0);
-                sh[shard_of(ek)].push(Ev { ek, uk, ts: t, ingest, price: if etc == 2 { pr } else { 0 }, cat, ok });
+                    && (etc != 2 || pr > 0)
+                    && ingest - t <= DAY;
+                let ing_rel = ingest.div_euclid(1000) - ws.div_euclid(1000);
+                if ing_rel < i32::MIN as i64 || ing_rel > i32::MAX as i64 {
+                    bail();
+                }
+                let h = ek.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                sh[(h >> 56) as usize].push(Ev {
+                    uk,
+                    ek,
+                    ingest: ing_rel as i32,
+                    ts: if ok { (t - ws) as u32 } else { 0 },
+                    price: if etc == 2 { pr } else { 0 },
+                    cat,
+                    ok,
+                });
             });
             sh
         })
@@ -494,29 +427,42 @@ fn main() {
         .into_par_iter()
         .map(|s| {
             let total: usize = parsed.iter().map(|c| c[s].len()).sum();
-            // keep, per event_id, the copy with the smallest ingest_ts (equal ingest => identical)
-            let mut best: AHashMap<u128, Ev> = AHashMap::with_capacity(total);
+            // Sub-bucket by more hash bits so each table stays in cache, then keep, per
+            // event_id, the copy with the smallest ingest_ts (equal ingest => identical).
+            const SB: usize = 16;
+            let mut sub: Vec<Vec<Ev>> = (0..SB).map(|_| Vec::with_capacity(total / SB * 9 / 8 + 16)).collect();
             for c in parsed.iter() {
                 for e in &c[s] {
+                    let h = { e.ek }.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    sub[((h >> 52) & (SB as u64 - 1)) as usize].push(*e);
+                }
+            }
+            let mut best: AHashMap<u64, Ev> = AHashMap::with_capacity(total / SB * 9 / 8 + 16);
+            let mut kept: Vec<Ev> = Vec::with_capacity(total);
+            for b in &sub {
+                best.clear();
+                for e in b {
                     match best.entry(e.ek) {
                         std::collections::hash_map::Entry::Vacant(x) => {
                             x.insert(*e);
                         }
                         std::collections::hash_map::Entry::Occupied(mut x) => {
-                            if e.ingest < x.get().ingest {
+                            let (a, b) = (e.ingest, x.get().ingest);
+                            if a < b {
                                 x.insert(*e);
                             }
                         }
                     }
                 }
+                kept.extend(best.values().copied());
             }
+            drop(sub);
             let guess = total / NS * 5 / 4 + 16;
             let mut out: Vec<Vec<Sv>> = (0..NS).map(|_| Vec::with_capacity(guess)).collect();
-            for e in best.values() {
-                let e = *e;
-                if e.ok && e.ingest - e.ts <= DAY {
+            for &e in &kept {
+                if e.ok {
                     let pk = pmap(e.uk);
-                    out[shard_of(pk)].push(Sv { pk, ts: e.ts, price: e.price, cat: e.cat });
+                    out[shard64(pk)].push(Sv { pk, ts: e.ts, price: e.price, cat: e.cat });
                 }
             }
             out
@@ -532,16 +478,15 @@ fn main() {
         .map(|c| {
             let guess = (c.end - c.start) / 45 / NS * 5 / 4 + 16;
             let mut sh: Vec<Vec<Cl>> = (0..NS).map(|_| Vec::with_capacity(guess)).collect();
-            for_lines(c, |l| {
-                let Some([cid, uid, camp, ts]) = fields::<4>(l) else { return };
+            for_records::<4>(c, |[cid, uid, camp, ts]| {
                 if cid.is_empty() {
                     return;
                 }
-                let ck = key(cid);
-                let uk = if uid.is_empty() { 0 } else { key(uid) };
+                let ck = code64(cid);
+                let uk = if uid.is_empty() { 0 } else { code64(uid) };
                 let cp = if camp.is_empty() { NO_CAMP } else { *campaigns.get(&key_or_miss(camp)).unwrap_or(&NO_CAMP) };
                 let t = parse_ts(ts);
-                sh[shard_of(ck)].push(Cl { ck, pk: uk, ts: t, camp: cp });
+                sh[shard64(ck)].push(Cl { ck, pk: uk, ts: t, camp: cp });
             });
             sh
         })
@@ -557,20 +502,16 @@ fn main() {
             for c in cparsed.iter() {
                 v.extend_from_slice(&c[s]);
             }
-            v.sort_unstable_by_key(|c| c.ck);
+            let mut seen: ahash::AHashSet<u64> = ahash::AHashSet::with_capacity(v.len());
             let mut out: Vec<Vec<Cl>> = (0..NS).map(|_| Vec::new()).collect();
-            let mut i = 0;
-            while i < v.len() {
-                let c = v[i];
-                let mut j = i + 1;
-                while j < v.len() && v[j].ck == c.ck {
-                    j += 1;
+            for &c in &v {
+                if !seen.insert(c.ck) {
+                    continue; // copies of a click are identical: keep the first
                 }
                 if c.pk != 0 && c.ts != BAD_TS && c.ts >= ws - WEEK && c.ts < we && c.camp != NO_CAMP {
                     let pk = pmap(c.pk);
-                    out[shard_of(pk)].push(Cl { pk, ..c });
+                    out[shard64(pk)].push(Cl { pk, ..c });
                 }
-                i = j;
             }
             out
         })
@@ -591,12 +532,18 @@ fn main() {
             for c in survivors.iter() {
                 ev.extend_from_slice(&c[s]);
             }
-            ev.sort_unstable_by(|a, b| (a.pk, a.ts).cmp(&(b.pk, b.ts)));
+            ev.sort_unstable_by(|a, b| {
+                let (ap, at, bp, bt) = (a.pk, a.ts, b.pk, b.ts);
+                (ap, at).cmp(&(bp, bt))
+            });
             let mut cl: Vec<Cl> = Vec::with_capacity(cvalid.iter().map(|c| c[s].len()).sum());
             for c in cvalid.iter() {
                 cl.extend_from_slice(&c[s]);
             }
-            cl.sort_unstable_by(|a, b| (a.pk, a.ts, a.ck).cmp(&(b.pk, b.ts, b.ck)));
+            cl.sort_unstable_by(|a, b| {
+                let (ap, at, bp, bt) = (a.pk, a.ts, b.pk, b.ts);
+                (ap, at).cmp(&(bp, bt))
+            });
 
             let mut rows: Vec<UserRow> = vec![];
             let mut camp = vec![[0i64; 4]; ncamp * ndays];
@@ -610,14 +557,14 @@ fn main() {
             while i < ev.len() {
                 let pk = ev[i].pk;
                 let mut j = i;
-                while j < ev.len() && ev[j].pk == pk {
+                while j < ev.len() && { ev[j].pk } == pk {
                     j += 1;
                 }
-                while ci < cl.len() && cl[ci].pk < pk {
+                while ci < cl.len() && { cl[ci].pk } < pk {
                     ci += 1;
                 }
                 let mut cj = ci;
-                while cj < cl.len() && cl[cj].pk == pk {
+                while cj < cl.len() && { cl[cj].pk } == pk {
                     cj += 1;
                 }
                 let clicks = &cl[ci..cj];
@@ -630,9 +577,9 @@ fn main() {
                 let mut k = i;
                 while k < j {
                     // one session: [k, m)
-                    let start = ev[k].ts;
+                    let start = ws + ev[k].ts as i64;
                     let mut m = k + 1;
-                    while m < j && ev[m].ts - ev[m - 1].ts <= GAP {
+                    while m < j && (ev[m].ts - ev[m - 1].ts) as i64 <= GAP {
                         m += 1;
                     }
                     let day = start.div_euclid(DAY);
@@ -672,8 +619,12 @@ fn main() {
                     let credited = if hi > lo {
                         let t = clicks[hi - 1].ts;
                         let mut p = hi - 1;
-                        while p > lo && clicks[p - 1].ts == t {
+                        while p > lo && { clicks[p - 1].ts } == t {
                             p -= 1;
+                        }
+                        if p + 1 < hi {
+                            // several clicks at the latest ts: the byte-wise smallest click_id
+                            p = (p..hi).min_by(|&a, &b| decode64(clicks[a].ck).cmp(&decode64(clicks[b].ck))).unwrap();
                         }
                         stamp_id += 1;
                         for c in &clicks[lo..hi] {
@@ -742,7 +693,7 @@ fn key_or_miss(b: &[u8]) -> u128 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn finish_row(pk: u128, day: i64, s: i64, e: i64, r: i64, cat_rev: &mut [i64], touched: &mut Vec<u8>, rank: &[u8; 256]) -> UserRow {
+fn finish_row(pk: u64, day: i64, s: i64, e: i64, r: i64, cat_rev: &mut [i64], touched: &mut Vec<u8>, rank: &[u8; 256]) -> UserRow {
     let mut top: Option<u8> = None;
     for &c in touched.iter() {
         let v = cat_rev[c as usize];
@@ -786,7 +737,7 @@ fn write_users<'a>(path: &Path, rows: impl Iterator<Item = &'a UserRow>, names: 
     let mut uid = StringBuilder::with_capacity(rows.len(), rows.len() * 10);
     let mut top = StringBuilder::with_capacity(rows.len(), rows.len() * 8);
     for r in &rows {
-        uid.append_value(utf8(&key_bytes(r.pk)));
+        uid.append_value(utf8(&decode64(r.pk)));
         match r.top {
             Some(c) => top.append_value(utf8(&names[c as usize])),
             None => top.append_null(),
