@@ -1,5 +1,5 @@
 # Team
 
 Name:
-Members: Arm
-Engine: DuckDB (+ SciPy for linked-ID components)
+Members: Arman Harutyunyan
+Engine: Rust (rayon, memchr, arrow/parquet); DuckDB pipeline as fallback
