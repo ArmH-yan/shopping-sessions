@@ -403,13 +403,47 @@ unsafe fn records_512<const N: usize>(data: &[u8], f: impl FnMut([&[u8]; N])) {
 
 #[inline(always)]
 fn records_impl<const N: usize, const W: bool>(data: &[u8], mut f: impl FnMut([&[u8]; N])) {
-    let empty: &[u8] = &data[..0];
-    let mut out: [&[u8]; N] = [empty; N];
-    let (mut n, mut start, mut line_start, mut bad) = (0usize, 0usize, 0usize, false);
     let len = data.len();
+    let mut pos = [0usize; N]; // pos[i]: the comma ending field i (i < N - 1)
+    let mut cnt = 0usize; // commas seen on the current line
+    let mut line_start = 0usize;
+    let mut q_line = 0u32; // quotes in data[..line_start]
+    let mut q_before_block = 0u32; // quotes in data[..base]
     let mut base = 0usize;
-    let mut q_before_block: u32 = 0; // quotes in data[..base]
-    let mut q_at_start: u32 = 0; // quotes in data[..start]
+    // One line [ls, le) with its N-1 comma positions: check quoting, split, call f.
+    let mut emit = |ls: usize, le: usize, pos: &[usize; N], quotes: u32| {
+        let mut out: [&[u8]; N] = [&data[..0]; N];
+        if quotes == 0 {
+            let mut a = ls;
+            for t in 0..N {
+                let b = if t + 1 < N { pos[t] } else { le };
+                out[t] = &data[a..b];
+                a = b + 1;
+            }
+            f(out);
+            return;
+        }
+        // quoted fields: each must start and end with a quote, or neither; at least 2 bytes;
+        // and those quotes must be all the quotes on the line
+        let mut good = true;
+        let mut wrapped_n = 0u32;
+        let mut a = ls;
+        for t in 0..N {
+            let b = if t + 1 < N { pos[t] } else { le };
+            let nonempty = b > a;
+            let sq = nonempty & (data[if nonempty { a } else { 0 }] == b'"');
+            let eq = nonempty & (data[if nonempty { b - 1 } else { 0 }] == b'"');
+            let w = sq & eq & (b - a >= 2);
+            good &= (sq == eq) & (sq == w);
+            wrapped_n += w as u32;
+            let wu = w as usize;
+            out[t] = &data[a + wu..b - wu];
+            a = b + 1;
+        }
+        if good && quotes == 2 * wrapped_n {
+            f(out);
+        }
+    };
     while base < len {
         let (cm, nm, qm) = if base + 64 <= len {
             #[cfg(target_arch = "x86_64")]
@@ -428,39 +462,26 @@ fn records_impl<const N: usize, const W: bool>(data: &[u8], mut f: impl FnMut([&
             let i = m.trailing_zeros();
             m &= m - 1;
             let p = base + i as usize;
-            let q_here = if qm == 0 { q_before_block } else { q_before_block + (qm & ((1u64 << i) - 1)).count_ones() };
-            let q = q_here - q_at_start;
-            // Field data[start..p], branch-free: valid when it has no quotes, or exactly two
-            // that wrap the whole field (and it is at least 2 bytes long).
-            let flen = p - start;
-            let wrapped = (q == 2) & (flen >= 2) & (data[start] == b'"') & (data[p.saturating_sub(1)] == b'"');
-            let valid = (q == 0) | wrapped;
-            let w = wrapped as usize;
-            let slot = if n < N { n } else { N - 1 };
-            out[slot] = &data[start + w..p - w];
-            if (cm >> i) & 1 == 1 {
-                bad |= !valid | (n + 1 >= N);
-                n += 1;
-            } else {
-                if !bad & valid & (p > line_start) & (n + 1 == N) {
-                    f(out);
+            if (nm >> i) & 1 == 0 {
+                if cnt + 1 < N {
+                    pos[cnt] = p;
                 }
-                n = 0;
+                cnt += 1;
+            } else {
+                let q_here = q_before_block + (qm & ((1u64 << i) - 1)).count_ones();
+                if cnt + 1 == N && p > line_start {
+                    emit(line_start, p, &pos, q_here - q_line);
+                }
+                cnt = 0;
                 line_start = p + 1;
-                bad = false;
+                q_line = q_here;
             }
-            start = p + 1;
-            q_at_start = q_here; // data[p] is not a quote
         }
         q_before_block += qm.count_ones();
         base += 64;
     }
-    let q = q_before_block - q_at_start;
-    if !bad && len > line_start && n + 1 == N {
-        if let Some(v) = field(data, start, len, q) {
-            out[n] = v;
-            f(out);
-        }
+    if cnt + 1 == N && len > line_start {
+        emit(line_start, len, &pos, q_before_block - q_line);
     }
 }
 

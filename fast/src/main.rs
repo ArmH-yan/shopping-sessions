@@ -283,22 +283,67 @@ fn bucket_of(x: u64) -> usize {
     (x.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 54) as usize
 }
 
-struct Buckets<T> {
-    v: Vec<std::sync::Mutex<Vec<Vec<T>>>>,
+/// One thread's NB buckets: a single arena (big enough for huge pages, so it faults in 2 MB
+/// at a time) cut into NB fixed regions of `cap` records; a bucket that outgrows its region
+/// continues in a spill vector.
+struct Arena<T> {
+    data: Vec<T>,
+    lens: Vec<u32>,
+    cap: usize,
+    spill: Vec<Vec<T>>,
 }
 
-impl<T: Send> Buckets<T> {
+impl<T: Copy> Arena<T> {
     fn new(cap: usize) -> Self {
-        let nt = rayon::current_num_threads().max(1);
-        Buckets {
-            v: (0..nt).map(|_| std::sync::Mutex::new((0..NB).map(|_| Vec::with_capacity(cap)).collect())).collect(),
+        let mut data = Vec::with_capacity(NB * cap);
+        unsafe { data.set_len(0) };
+        Arena { data, lens: vec![0; NB], cap, spill: (0..NB).map(|_| Vec::new()).collect() }
+    }
+    #[inline(always)]
+    fn push(&mut self, b: usize, x: T) {
+        let l = self.lens[b] as usize;
+        if l < self.cap {
+            unsafe { self.data.as_mut_ptr().add(b * self.cap + l).write(x) };
+            self.lens[b] = l as u32 + 1;
+        } else {
+            self.spill[b].push(x);
         }
     }
-    fn with<R>(&self, f: impl FnOnce(&mut Vec<Vec<T>>) -> R) -> R {
+    /// The records of bucket b: its region, then its spill.
+    #[inline]
+    fn bucket(&self, b: usize) -> (&[T], &[T]) {
+        let l = self.lens[b] as usize;
+        let r = unsafe { std::slice::from_raw_parts(self.data.as_ptr().add(b * self.cap), l) };
+        (r, &self.spill[b])
+    }
+    #[inline]
+    fn bucket_len(&self, b: usize) -> usize {
+        self.lens[b] as usize + self.spill[b].len()
+    }
+    #[inline]
+    fn get(&self, b: usize, i: usize) -> &T {
+        let l = self.lens[b] as usize;
+        if i < l { unsafe { &*self.data.as_ptr().add(b * self.cap + i) } } else { &self.spill[b][i - l] }
+    }
+    fn total(&self) -> usize {
+        (0..NB).map(|b| self.bucket_len(b)).sum()
+    }
+}
+
+struct Buckets<T> {
+    v: Vec<std::sync::Mutex<Arena<T>>>,
+}
+
+impl<T: Send + Copy> Buckets<T> {
+    fn new(cap: usize) -> Self {
+        let nt = rayon::current_num_threads().max(1);
+        Buckets { v: (0..nt).map(|_| std::sync::Mutex::new(Arena::new(cap))).collect() }
+    }
+    fn with<R>(&self, f: impl FnOnce(&mut Arena<T>) -> R) -> R {
         let i = rayon::current_thread_index().unwrap_or(0) % self.v.len();
         f(&mut self.v[i].lock().unwrap())
     }
-    fn into_inner(self) -> Vec<Vec<Vec<T>>> {
+    fn into_inner(self) -> Vec<Arena<T>> {
         self.v.into_iter().map(|m| m.into_inner().unwrap()).collect()
     }
 }
@@ -370,6 +415,53 @@ thread_local! {
     static SCRATCH: std::cell::RefCell<Group> = std::cell::RefCell::new(Group::default());
 }
 
+/// Stable LSD radix sort by a 32-bit key, three passes of 11 bits (for big groups: whales).
+fn radix_sort_u32<T: Copy>(v: &mut [T], tmp: &mut Vec<T>, key: impl Fn(&T) -> u32) {
+    let n = v.len();
+    tmp.clear();
+    tmp.reserve(n);
+    unsafe { tmp.set_len(n) };
+    let mut src_is_v = true;
+    for pass in 0..3 {
+        let shift = pass * 11;
+        let mut cnt = [0u32; 2048];
+        {
+            let src: &[T] = if src_is_v { v } else { tmp };
+            for x in src {
+                cnt[((key(x) >> shift) & 2047) as usize] += 1;
+            }
+            if cnt.iter().any(|&c| c as usize == n) {
+                continue; // every key has the same digit: nothing to move
+            }
+        }
+        let mut acc = 0u32;
+        for c in cnt.iter_mut() {
+            let x = *c;
+            *c = acc;
+            acc += x;
+        }
+        if src_is_v {
+            for x in v.iter() {
+                let d = ((key(x) >> shift) & 2047) as usize;
+                tmp[cnt[d] as usize] = *x;
+                cnt[d] += 1;
+            }
+        } else {
+            for x in tmp.iter() {
+                let d = ((key(x) >> shift) & 2047) as usize;
+                v[cnt[d] as usize] = *x;
+                cnt[d] += 1;
+            }
+        }
+        src_is_v = !src_is_v;
+    }
+    if !src_is_v {
+        v.copy_from_slice(&tmp[..n]);
+    }
+}
+
+const RADIX_MIN: usize = 2048;
+
 /// Per-thread scratch for grouping one bucket by person.
 #[derive(Default)]
 struct Group {
@@ -382,6 +474,9 @@ struct Group {
     ev_out: Vec<Sv>,
     cl_out: Vec<Cl>,
     persons: Vec<u64>,
+    tmp_ev: Vec<Sv>,
+    tmp_cl: Vec<Cl>,
+    cl_base: i64, // clicks' ts are sorted as u32 offsets from this
 }
 
 impl Group {
@@ -450,8 +545,10 @@ impl Group {
                         }
                         g[b] = x;
                     }
-                } else {
+                } else if g.len() < RADIX_MIN {
                     g.sort_unstable_by_key(|e| e.ts);
+                } else {
+                    radix_sort_u32(g, &mut self.tmp_ev, |e| e.ts);
                 }
             }
         }
@@ -501,7 +598,10 @@ impl Group {
         }
         for d in 0..np {
             let g = &mut self.cl_out[ccount[d] as usize..ccount[d + 1] as usize];
-            if g.len() > 1 {
+            if g.len() >= RADIX_MIN {
+                let base = self.cl_base;
+                radix_sort_u32(g, &mut self.tmp_cl, |c| (c.ts - base) as u32);
+            } else if g.len() > 1 {
                 g.sort_unstable_by_key(|c| c.ts);
             }
         }
@@ -511,12 +611,12 @@ impl Group {
 
 /// Calls `keep(&T)` once per distinct key over all threads' bucket `b`, choosing the element
 /// with the smallest `rank` (first seen on ties; callers only tie on identical copies).
-fn dedup_bucket<T: Copy>(parts: &[Vec<Vec<T>>], b: usize, key: impl Fn(&T) -> u64, rank: impl Fn(&T) -> i32, mut keep: impl FnMut(&T)) {
-    let n: usize = parts.iter().map(|t| t[b].len()).sum();
+fn dedup_bucket<T: Copy>(parts: &[Arena<T>], b: usize, key: impl Fn(&T) -> u64, rank: impl Fn(&T) -> i32, mut keep: impl FnMut(&T)) {
+    let n: usize = parts.iter().map(|t| t.bucket_len(b)).sum();
     if n == 0 {
         return;
     }
-    if parts.len() > 63 || parts.iter().any(|t| t[b].len() >= 1 << 26) {
+    if parts.len() > 63 || parts.iter().any(|t| t.bucket_len(b) >= 1 << 26) {
         bail(); // locations would not fit; the fallback pipeline takes over
         return;
     }
@@ -530,7 +630,8 @@ fn dedup_bucket<T: Copy>(parts: &[Vec<Vec<T>>], b: usize, key: impl Fn(&T) -> u6
         tab.fill(Slot::default());
         let mask = cap - 1;
         for (pi, part) in parts.iter().enumerate() {
-            for (ei, e) in part[b].iter().enumerate() {
+            let (r, sp) = part.bucket(b);
+            for (ei, e) in r.iter().chain(sp.iter()).enumerate() {
                 let k = key(e);
                 let r = rank(e);
                 let loc = ((pi as u32) << 26) | ei as u32;
@@ -554,7 +655,7 @@ fn dedup_bucket<T: Copy>(parts: &[Vec<Vec<T>>], b: usize, key: impl Fn(&T) -> u6
         }
         for sl in tab.iter() {
             if sl.key != 0 {
-                keep(&parts[(sl.loc >> 26) as usize][b][(sl.loc & ((1 << 26) - 1)) as usize]);
+                keep(parts[(sl.loc >> 26) as usize].get(b, (sl.loc & ((1 << 26) - 1)) as usize));
             }
         }
     });
@@ -737,11 +838,11 @@ fn main() {
     std::mem::forget(pairs);
         person
     };
-    let events_job = || -> Vec<Vec<Vec<Ev>>> {
+    let events_job = || -> Vec<Arena<Ev>> {
     // ---------------------------------------------------------- events: parse
     let ev_chunks = chunks(&data.join("events"));
     let bytes: usize = ev_chunks.iter().map(|c| c.end - c.start).sum();
-    let evb: Buckets<Ev> = Buckets::new(bytes / 70 / NB / rayon::current_num_threads().max(1) * 5 / 4 + 16);
+    let evb: Buckets<Ev> = Buckets::new(bytes / 70 / NB / rayon::current_num_threads().max(1) * 2 + 64);
     ev_chunks.par_iter().for_each(|c| {
         evb.with(|sh| {
             let mut tsp = TsParser::default();
@@ -782,7 +883,7 @@ fn main() {
                 if ing_rel < i32::MIN as i64 || ing_rel > i32::MAX as i64 {
                     bail();
                 }
-                sh[bucket_of(ek)].push(Ev {
+                sh.push(bucket_of(ek), Ev {
                     uk,
                     ek,
                     ingest: ing_rel as i32,
@@ -808,8 +909,8 @@ fn main() {
 
     // events: dedup per bucket (earliest ingest_ts wins), keep valid copies, move to person buckets
     let nt = rayon::current_num_threads().max(1);
-    let n_ev: usize = parsed.iter().flatten().map(|b| b.len()).sum();
-    let sv: Buckets<Sv> = Buckets::new(n_ev / NB / nt * 5 / 4 + 16);
+    let n_ev: usize = parsed.iter().map(|a| a.total()).sum();
+    let sv: Buckets<Sv> = Buckets::new(n_ev / NB / nt * 2 + 64);
     (0..NB).into_par_iter().for_each(|b| {
         sv.with(|out| {
             let mut kept: Vec<Ev> = Vec::with_capacity(4096);
@@ -825,7 +926,7 @@ fn main() {
                 }
                 let e = kept[i];
                 let pk = person.get(e.uk);
-                out[bucket_of(pk)].push(Sv { pk, ts: e.ts, price: e.price, cat: e.cat });
+                out.push(bucket_of(pk), Sv { pk, ts: e.ts, price: e.price, cat: e.cat });
             }
         })
     });
@@ -836,7 +937,7 @@ fn main() {
     // ---------------------------------------------------------- clicks
     let cl_chunks = chunks(&data.join("clicks"));
     lap("  clicks mapped");
-    let cb: Buckets<Cl> = Buckets::new(cl_chunks.iter().map(|c| c.end - c.start).sum::<usize>() / 45 / NB / nt * 5 / 4 + 16);
+    let cb: Buckets<Cl> = Buckets::new(cl_chunks.iter().map(|c| c.end - c.start).sum::<usize>() / 45 / NB / nt * 2 + 64);
     cl_chunks.par_iter().for_each(|c| {
         cb.with(|sh| {
             let mut tsp = TsParser::default();
@@ -848,7 +949,7 @@ fn main() {
                 let uk = if uid.is_empty() { 0 } else { code64(uid) };
                 let cp = if camp.is_empty() { NO_CAMP } else { *campaigns.get(&key_or_miss(camp)).unwrap_or(&NO_CAMP) };
                 let t = tsp.parse(ts);
-                sh[bucket_of(ck)].push(Cl { ck, pk: uk, ts: t, camp: cp });
+                sh.push(bucket_of(ck), Cl { ck, pk: uk, ts: t, camp: cp });
             });
         })
     });
@@ -857,8 +958,8 @@ fn main() {
     }
     let cparsed = cb.into_inner();
     lap("  clicks parsed");
-    let n_cl: usize = cparsed.iter().flatten().map(|b| b.len()).sum();
-    let cvb: Buckets<Cl> = Buckets::new(n_cl / NB / nt * 5 / 4 + 16);
+    let n_cl: usize = cparsed.iter().map(|a| a.total()).sum();
+    let cvb: Buckets<Cl> = Buckets::new(n_cl / NB / nt * 2 + 64);
     (0..NB).into_par_iter().for_each(|b| {
         cvb.with(|out| {
             // copies of a click are identical: keep any one
@@ -875,7 +976,7 @@ fn main() {
                 }
                 let c = kept[i];
                 let pk = person.get(c.pk);
-                out[bucket_of(pk)].push(Cl { pk, ..c });
+                out.push(bucket_of(pk), Cl { pk, ..c });
             }
         })
     });
@@ -890,8 +991,9 @@ fn main() {
     struct Acc {
         rows: Vec<UserRow>,
         camp: Vec<[i64; 4]>,
-        stamp: Vec<u64>,
-        stamp_id: u64,
+        win: Vec<u32>,     // clicks per campaign in the current 7-day window
+        active: Vec<u16>,  // campaigns with win > 0
+        at: Vec<u32>,      // position of a campaign in `active`
         cat_rev: Vec<i64>,
         touched: Vec<u8>,
     }
@@ -904,27 +1006,39 @@ fn main() {
                     v.resize(ncamp * ndays, [0i64; 4]); // real writes (see PTab::new)
                     v
                 },
-                stamp: vec![0u64; ncamp],
-                stamp_id: 0,
+                win: vec![0u32; ncamp],
+                active: Vec::with_capacity(ncamp),
+                at: vec![0u32; ncamp],
                 cat_rev: vec![0i64; ncat_slots],
                 touched: vec![],
             })
         })
         .collect();
-    (0..NB).into_par_iter().for_each(|s| {
+    // Biggest buckets first (a whale person can make one bucket 20x the average), one bucket
+    // per task, so no thread is left with a big one at the end of the phase.
+    let mut order: Vec<(usize, usize)> = (0..NB)
+        .map(|s| (survivors.iter().map(|t| t.bucket_len(s)).sum::<usize>() + cvalid.iter().map(|t| t.bucket_len(s)).sum::<usize>(), s))
+        .collect();
+    order.sort_unstable_by(|a, b| b.cmp(a));
+    order.par_iter().with_max_len(1).for_each(|&(_, s)| {
         let me = rayon::current_thread_index().unwrap_or(0) % nt;
         let mut acc = accs[me].lock().unwrap();
-        let Acc { rows, camp, stamp, stamp_id, cat_rev, touched } = &mut *acc;
+        let Acc { rows, camp, win, active, at, cat_rev, touched } = &mut *acc;
         SCRATCH.with(|sc| {
             let mut g = sc.borrow_mut();
             g.ev.clear();
             for t in survivors.iter() {
-                g.ev.extend_from_slice(&t[s]);
+                let (a, b) = t.bucket(s);
+                g.ev.extend_from_slice(a);
+                g.ev.extend_from_slice(b);
             }
             g.cl.clear();
             for t in cvalid.iter() {
-                g.cl.extend_from_slice(&t[s]);
+                let (a, b) = t.bucket(s);
+                g.cl.extend_from_slice(a);
+                g.cl.extend_from_slice(b);
             }
+            g.cl_base = ws - WEEK; // valid clicks are in [ws - 7d, we): offsets fit in u32
             g.build();
             let g = &*g;
             for d in 0..g.persons.len() {
@@ -973,11 +1087,26 @@ fn main() {
                     d_events += (m - k) as i64;
                     d_rev += rev;
 
-                    // click window [start - 7d, start]
+                    // click window [start - 7d, start], with live per-campaign counts
                     while hi < clicks.len() && clicks[hi].ts <= start {
+                        let cc = clicks[hi].camp as usize;
+                        if win[cc] == 0 {
+                            at[cc] = active.len() as u32;
+                            active.push(cc as u16);
+                        }
+                        win[cc] += 1;
                         hi += 1;
                     }
                     while lo < hi && clicks[lo].ts < start - WEEK {
+                        let cc = clicks[lo].camp as usize;
+                        win[cc] -= 1;
+                        if win[cc] == 0 {
+                            let p = at[cc] as usize;
+                            let last = *active.last().unwrap();
+                            active[p] = last;
+                            at[last as usize] = p as u32;
+                            active.pop();
+                        }
                         lo += 1;
                     }
                     let di = (day - day0) as usize;
@@ -991,13 +1120,9 @@ fn main() {
                             // several clicks at the latest ts: the byte-wise smallest click_id
                             p = (p..hi).min_by(|&a, &b| decode64(clicks[a].ck).cmp(&decode64(clicks[b].ck))).unwrap();
                         }
-                        *stamp_id += 1;
-                        for c in &clicks[lo..hi] {
-                            let cc = c.camp as usize;
-                            if stamp[cc] != *stamp_id {
-                                stamp[cc] = *stamp_id;
-                                camp[cc * ndays + di][3] += 1;
-                            }
+                        // every campaign with a click in the window assists once
+                        for &cc in active.iter() {
+                            camp[cc as usize * ndays + di][3] += 1;
                         }
                         clicks[p].camp
                     } else {
@@ -1012,6 +1137,11 @@ fn main() {
                 if cur_day != i64::MIN {
                     rows.push(finish_row(pk, cur_day, d_sessions, d_events, d_rev, cat_rev, touched, &rank));
                 }
+                // empty the window for the next person
+                for &cc in active.iter() {
+                    win[cc as usize] = 0;
+                }
+                active.clear();
             }
         });
     });
